@@ -153,18 +153,18 @@ class SyncNetBoxVMsToOpenStack(Script):
         for vm in netbox_vms:
             try:
                 conn = self._get_connection_for_vm(openstack, data, vm, connection_cache)
-                result = self._sync_vm(
-                    conn=conn,
-                    vm=vm,
-                    data=data,
-                    commit=commit,
-                )
-                if result == "created":
-                    created_count += 1
-                elif result == "updated":
-                    updated_count += 1
-                else:
-                    unchanged_count += 1
+                # result = self._sync_vm(
+                #     conn=conn,
+                #     vm=vm,
+                #     data=data,
+                #     commit=commit,
+                # )
+                # if result == "created":
+                #     created_count += 1
+                # elif result == "updated":
+                #     updated_count += 1
+                # else:
+                #     unchanged_count += 1
             except Exception as exc:
                 failed_count += 1
                 self.log_failure(f"Failed to sync NetBox VM {vm.name}: {exc}", vm)
