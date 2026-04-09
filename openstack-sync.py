@@ -57,10 +57,12 @@ class SyncNetBoxVMsToOpenStack(Script):
     )
     user_domain_name = StringVar(
         required=False,
+        default="Default",
         description="User domain name, for example Default",
     )
     project_domain_name = StringVar(
         required=False,
+        default="Default",
         description="Project domain name, for example Default",
     )
     verify = BooleanVar(
@@ -82,7 +84,6 @@ class SyncNetBoxVMsToOpenStack(Script):
         required=False,
         description="Optional prefix to limit synchronization to matching NetBox VM names",
     )
-
     allow_rename = BooleanVar(
         required=False,
         default=True,
@@ -153,18 +154,18 @@ class SyncNetBoxVMsToOpenStack(Script):
         for vm in netbox_vms:
             try:
                 conn = self._get_connection_for_vm(openstack, data, vm, connection_cache)
-                # result = self._sync_vm(
-                #     conn=conn,
-                #     vm=vm,
-                #     data=data,
-                #     commit=commit,
-                # )
-                # if result == "created":
-                #     created_count += 1
-                # elif result == "updated":
-                #     updated_count += 1
-                # else:
-                #     unchanged_count += 1
+                result = self._sync_vm(
+                    conn=conn,
+                    vm=vm,
+                    data=data,
+                    commit=commit,
+                )
+                if result == "created":
+                    created_count += 1
+                elif result == "updated":
+                    updated_count += 1
+                else:
+                    unchanged_count += 1
             except Exception as exc:
                 failed_count += 1
                 self.log_failure(f"Failed to sync NetBox VM {vm.name}: {exc}", vm)
@@ -246,21 +247,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             self.log_success(f"Synchronized {vm.name}: {', '.join(changes)}", vm)
         return "updated"
 
-    def _get_connection_for_vm(self, openstack, data, vm, connection_cache):
-        project_id = self._get_vm_cf_value(vm, "openstack_project_id")
-        project_name = self._get_vm_cf_value(vm, "openstack_project_name")
-        region_name = self._get_vm_cf_value(vm, "openstack_location_region")
-
-        if not project_id and not project_name:
-            raise AbortScript(
-                f"NetBox VM {vm.name} is missing custom field openstack_project_id or openstack_project_name"
-            )
-
-        cache_key = (project_id or "", project_name or "", region_name or "")
-        cached = connection_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    def _build_openstack_conn_kwargs(self, data, region_name=None, project_id=None, project_name=None):
         conn_kwargs = {
             "auth_url": data["auth_url"].strip(),
             "username": data["username"].strip(),
@@ -283,10 +270,61 @@ class SyncNetBoxVMsToOpenStack(Script):
         if region_name:
             conn_kwargs["region_name"] = region_name
 
+        return conn_kwargs
+
+    def _get_base_connection(self, openstack, data, region_name, connection_cache):
+        base_key = ("__base__", region_name or "")
+        cached = connection_cache.get(base_key)
+        if cached is not None:
+            return cached
+
+        conn_kwargs = self._build_openstack_conn_kwargs(data, region_name=region_name)
         try:
-            conn = openstack.connect(**conn_kwargs)
+            base_conn = openstack.connect(**conn_kwargs)
         except Exception as exc:
-            raise AbortScript(f"Could not authenticate to OpenStack for VM {vm.name}: {exc}") from exc
+            raise AbortScript(f"Could not establish OpenStack session for region {region_name or '<default>'}: {exc}") from exc
+
+        connection_cache[base_key] = base_conn
+        return base_conn
+
+    def _get_connection_for_vm(self, openstack, data, vm, connection_cache):
+        project_id = self._get_vm_cf_value(vm, "openstack_project_id")
+        project_name = self._get_vm_cf_value(vm, "openstack_project_name")
+        region_name = self._get_vm_cf_value(vm, "openstack_location_region")
+
+        if not project_id and not project_name:
+            raise AbortScript(
+                f"NetBox VM {vm.name} is missing custom field openstack_project_id or openstack_project_name"
+            )
+
+        cache_key = (project_id or "", project_name or "", region_name or "")
+        cached = connection_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        base_conn = self._get_base_connection(openstack, data, region_name, connection_cache)
+
+        if hasattr(base_conn, "connect_as_project"):
+            project_ref = project_id or project_name
+            try:
+                conn = base_conn.connect_as_project(project_ref)
+            except Exception as exc:
+                raise AbortScript(
+                    f"Could not switch OpenStack session to project {project_ref} for VM {vm.name}: {exc}"
+                ) from exc
+        else:
+            conn_kwargs = self._build_openstack_conn_kwargs(
+                data,
+                region_name=region_name,
+                project_id=project_id,
+                project_name=project_name,
+            )
+            try:
+                conn = openstack.connect(**conn_kwargs)
+            except Exception as exc:
+                raise AbortScript(
+                    f"Could not authenticate to OpenStack for VM {vm.name}: {exc}"
+                ) from exc
 
         connection_cache[cache_key] = conn
         return conn
