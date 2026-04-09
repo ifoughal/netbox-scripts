@@ -1200,7 +1200,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 "field": field,
                 "openstack_value": openstack_text,
                 "netbox_value": netbox_text,
-                "diff": f"{openstack_text} -> {netbox_text}",
+                "diff": f"{netbox_text} -> {openstack_text}",
                 "details": details,
                 "state": state,
                 "mode": mode or ("apply" if commit else "dry-run"),
@@ -1276,8 +1276,8 @@ class SyncNetBoxVMsToOpenStack(Script):
         headers = [
             "Type",
             "Field",
-            "OpenStack",
             "NetBox",
+            "OpenStack",
             "Diff",
             "Mode",
             "Details",
@@ -1291,8 +1291,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             line = [
                 row["change_type"],
                 row["field"],
-                row["openstack_value"],
                 row["netbox_value"],
+                row["openstack_value"],
                 row["diff"],
                 row["mode"],
                 row["details"],
