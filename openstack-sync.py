@@ -1229,6 +1229,34 @@ class SyncNetBoxVMsToOpenStack(Script):
             }
         )
 
+    def _comparison_row_log_method(self, row):
+        """Return the NetBox logging method that matches a comparison row."""
+        if row.get("state") == "matched":
+            return self.log_success
+        if row.get("comparison_group") == "to_sync":
+            return self.log_failure
+        if row.get("comparison_group") == "report_only":
+            return self.log_warning
+        if row.get("mode") == "apply":
+            return self.log_success
+        if row.get("mode") == "dry-run":
+            return self.log_warning
+        return self.log_info
+
+    def _comparison_row_label(self, row):
+        """Return a short human-readable status label for a comparison row."""
+        if row.get("state") == "matched":
+            return "PASS"
+        if row.get("comparison_group") == "to_sync":
+            return "FAIL"
+        if row.get("comparison_group") == "report_only":
+            return "WARN"
+        if row.get("mode") == "apply":
+            return "APPLIED"
+        if row.get("mode") == "dry-run":
+            return "DRY-RUN"
+        return "INFO"
+
     def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
         """Render the accumulated comparison rows as a Markdown summary block."""
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
@@ -1323,6 +1351,89 @@ class SyncNetBoxVMsToOpenStack(Script):
 
         self.log_info("\n".join(lines), obj=nb_vm)
 
+    def _log_change_report(self, nb_vm, os_server, change_rows, commit):
+        """Render change rows as a severity-colored NetBox report."""
+        summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
+        if not change_rows:
+            return
+
+        # Keep the same grouping order as the table summary so the report is
+        # easy to scan even though we emit one line per row.
+        change_order = {
+            "create": 0,
+            "identity": 1,
+            "rename": 2,
+            "metadata": 3,
+            "power": 4,
+            "to_sync": 5,
+            "report_only": 6,
+            "match": 99,
+        }
+        ordered_rows = sorted(
+            enumerate(change_rows),
+            key=lambda item: (change_order.get(item[1]["change_type"], 99), item[0]),
+        )
+
+        applied_change_count = sum(
+            1
+            for row in change_rows
+            if row.get("mode") not in {"report", "sync", "match"} and row.get("state", "changed") != "matched"
+        )
+        to_sync_count = sum(1 for row in change_rows if row.get("comparison_group") == "to_sync")
+        report_only_count = sum(1 for row in change_rows if row.get("comparison_group") == "report_only")
+        comparison_count = len(change_rows)
+        comparison_suffix = f"{comparison_count} field comparison{'s' if comparison_count != 1 else ''}"
+        to_sync_suffix = (
+            f"{to_sync_count} to_sync comparison{'s' if to_sync_count != 1 else ''}"
+            if to_sync_count
+            else ""
+        )
+        report_only_suffix = (
+            f"{report_only_count} report-only comparison{'s' if report_only_count != 1 else ''}"
+            if report_only_count
+            else ""
+        )
+        if applied_change_count == 0:
+            summary_suffix = f"(0 applied changes, {comparison_suffix}"
+            if to_sync_suffix:
+                summary_suffix += f", {to_sync_suffix}"
+            if report_only_suffix:
+                summary_suffix += f", {report_only_suffix}"
+            summary_suffix += ")"
+        else:
+            summary_suffix = (
+                f"({applied_change_count} applied change{'s' if applied_change_count != 1 else ''}, "
+                f"{comparison_suffix}"
+            )
+            if to_sync_suffix:
+                summary_suffix += f", {to_sync_suffix}"
+            if report_only_suffix:
+                summary_suffix += f", {report_only_suffix}"
+            summary_suffix += ")"
+
+        self.log_info(
+            f"### Change report for {self._nb_vm_ref(nb_vm)} against {summary_target} {summary_suffix}",
+            obj=nb_vm,
+        )
+
+        for _, row in ordered_rows:
+            label = self._comparison_row_label(row)
+            if row.get("state") == "matched":
+                comparison_text = (
+                    f"NetBox `{self._summary_value(row['netbox_value'])}` "
+                    f"== OpenStack `{self._summary_value(row['openstack_value'])}`"
+                )
+            else:
+                comparison_text = (
+                    f"NetBox `{self._summary_value(row['netbox_value'])}` "
+                    f"-> OpenStack `{self._summary_value(row['openstack_value'])}`"
+                )
+
+            detail = row.get("details")
+            detail_text = f" | Details `{detail}`" if detail and detail != "matched" else ""
+            message = f"**{label}** `{row['field']}`: {comparison_text}{detail_text}"
+            self._comparison_row_log_method(row)(message, obj=nb_vm)
+
     def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False):
         """Reconcile one NetBox VM against its matching OpenStack server."""
         change_rows = []
@@ -1366,7 +1477,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                     commit,
                     details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
                 )
-                self._log_change_summary(nb_vm, None, change_rows, commit)
+                self._log_change_report(nb_vm, None, change_rows, commit)
                 return "created"
 
             # In apply mode we create the instance after resolving its resources.
@@ -1425,8 +1536,8 @@ class SyncNetBoxVMsToOpenStack(Script):
                     record_change=self._record_change,
                     nb_vm=nb_vm,
                 )
-            # Sync-tracked field comparisons are surfaced in the summary,
-            # while report-only checks cover flavor sizing drift.
+            # Emit the comparison output as a NetBox-style report, with
+            # severity coloring for matched and drifting rows.
             os_instance.compare_field_groups(
                 nb_vm=nb_vm,
                 commit=commit,
@@ -1435,7 +1546,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 sync_debug=sync_debug,
                 log_debug=self.log_debug,
             )
-            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+            self._log_change_report(nb_vm, os_instance, change_rows, commit)
             return "created"
 
         os_server_ref = os_instance.ref()
@@ -1504,8 +1615,8 @@ class SyncNetBoxVMsToOpenStack(Script):
                 nb_vm=nb_vm,
             ) or changed
 
-        # Sync-tracked field comparisons are surfaced in the summary, while
-        # report-only checks cover flavor sizing drift.
+        # Emit the comparison output as a NetBox-style report, with severity
+        # coloring for matched and drifting rows.
         os_instance.compare_field_groups(
             nb_vm=nb_vm,
             commit=commit,
@@ -1515,7 +1626,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             log_debug=self.log_debug,
         )
 
-        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+        self._log_change_report(nb_vm, os_instance, change_rows, commit)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
