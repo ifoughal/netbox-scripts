@@ -15,6 +15,544 @@ from utilities.exceptions import AbortScript
 from virtualization.models import Cluster, VirtualMachine
 
 
+class OpenStackInstance:
+    def __init__(self, conn, resource):
+        self.conn = conn
+        self.resource = None
+        self.raw = {}
+        self.load(resource)
+
+    @staticmethod
+    def _nb_vm_ref(nb_vm):
+        return f"NetBox VM {nb_vm.name} (id={nb_vm.pk})"
+
+    @staticmethod
+    def _os_server_ref(resource):
+        server_name = getattr(resource, "name", None) or "<unnamed>"
+        server_id = getattr(resource, "id", None) or "<unknown>"
+        return f"OpenStack server {server_name} (id={server_id})"
+
+    @staticmethod
+    def _get_attr(obj, *paths):
+        for path in paths:
+            current = obj
+            for part in path.split("."):
+                if current is None:
+                    break
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    current = getattr(current, part, None)
+            if current not in (None, "", []):
+                return current
+        return None
+
+    @staticmethod
+    def _metadata_scalar(value):
+        if value in (None, ""):
+            return ""
+
+        if isinstance(value, dict):
+            for key in ("name", "value", "label", "display", "slug", "id"):
+                nested = value.get(key)
+                if nested not in (None, ""):
+                    return str(nested).strip()
+            return json.dumps(value, sort_keys=True)
+
+        if isinstance(value, (list, tuple, set)):
+            parts = [OpenStackInstance._metadata_scalar(item) for item in value]
+            parts = [item for item in parts if item]
+            return ",".join(parts)
+
+        if hasattr(value, "name") and getattr(value, "name", None) not in (None, ""):
+            return str(getattr(value, "name")).strip()
+
+        return str(value).strip()
+
+    @staticmethod
+    def _resource_data(resource):
+        if resource is None:
+            return {}
+        if isinstance(resource, dict):
+            return resource
+        if hasattr(resource, "to_dict"):
+            try:
+                data = resource.to_dict()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    @staticmethod
+    def _security_group_names(groups):
+        if groups in (None, ""):
+            return []
+
+        names = []
+        sequence = groups if isinstance(groups, (list, tuple, set)) else [groups]
+        for group in sequence:
+            name = OpenStackInstance._metadata_scalar(
+                OpenStackInstance._get_attr(group, "name") if not isinstance(group, str) else group
+            )
+            if name:
+                names.append(name)
+
+        deduped = []
+        seen = set()
+        for name in sorted(names, key=str.lower):
+            normalized = name.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(name)
+        return deduped
+
+    @staticmethod
+    def _vm_cf_data(nb_vm):
+        data = getattr(nb_vm, "custom_field_data", None)
+        if isinstance(data, dict):
+            return data
+        data = getattr(nb_vm, "cf", None)
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    @staticmethod
+    def _vm_cf_value(nb_vm, field_name):
+        value = OpenStackInstance._vm_cf_data(nb_vm).get(field_name)
+        if value in (None, "", []):
+            return None
+        if isinstance(value, list) and len(value) == 1:
+            return value[0]
+        return value
+
+    @classmethod
+    def retrieve(cls, conn, nb_vm, log_debug=None):
+        resource = cls._find_resource_for_vm(conn, nb_vm, log_debug=log_debug)
+        if resource is None:
+            return None
+        return cls(conn, resource)
+
+    @classmethod
+    def _find_resource_for_vm(cls, conn, nb_vm, log_debug=None):
+        openstack_id = cls._vm_cf_value(nb_vm, "openstack_id") or (nb_vm.serial or "").strip()
+        if openstack_id:
+            os_server = conn.compute.find_server(openstack_id, ignore_missing=True)
+            if log_debug is not None:
+                log_debug(
+                    f"Looking up OpenStack server by openstack_id={openstack_id!r} "
+                    f"for {cls._nb_vm_ref(nb_vm)}: "
+                    f"{'found ' + cls._os_server_ref(os_server) if os_server else 'not found'}",
+                    obj=nb_vm,
+                )
+            if os_server is not None:
+                return os_server
+
+        serial = (nb_vm.serial or "").strip()
+        if serial:
+            os_server = conn.compute.find_server(serial, ignore_missing=True)
+            if log_debug is not None:
+                log_debug(
+                    f"Looking up OpenStack server by serial={serial!r} "
+                    f"for {cls._nb_vm_ref(nb_vm)}: "
+                    f"{'found ' + cls._os_server_ref(os_server) if os_server else 'not found'}",
+                    obj=nb_vm,
+                )
+            if os_server is not None:
+                return os_server
+
+        try:
+            os_server = conn.compute.find_server(nb_vm.name, ignore_missing=True)
+        except Exception:
+            os_server = None
+
+        if log_debug is not None:
+            log_debug(
+                f"Looking up OpenStack server by name={nb_vm.name!r} "
+                f"for {cls._nb_vm_ref(nb_vm)}: "
+                f"{'found ' + cls._os_server_ref(os_server) if os_server else 'not found'}",
+                obj=nb_vm,
+            )
+
+        return os_server
+
+    @classmethod
+    def create(
+        cls,
+        conn,
+        nb_vm,
+        image,
+        flavor,
+        network,
+        key_name=None,
+        availability_zone=None,
+        security_groups=None,
+        metadata=None,
+        wait_for_active=True,
+    ):
+        create_args = {
+            "name": nb_vm.name,
+            "image_id": image.id,
+            "flavor_id": flavor.id,
+            "networks": [{"uuid": network.id}],
+        }
+
+        if key_name:
+            create_args["key_name"] = key_name
+        if availability_zone:
+            create_args["availability_zone"] = availability_zone
+        if security_groups:
+            create_args["security_groups"] = [{"name": group_name} for group_name in security_groups]
+        if metadata:
+            create_args["metadata"] = metadata
+
+        os_server = conn.compute.create_server(**create_args)
+        if wait_for_active:
+            os_server = conn.compute.wait_for_server(
+                os_server,
+                status="ACTIVE",
+                failures=["ERROR"],
+                wait=600,
+            )
+
+        return cls(conn, os_server)
+
+    @classmethod
+    def desired_metadata(cls, nb_vm):
+        metadata = {
+            "netbox_vm_id": str(nb_vm.pk),
+            "netbox_vm_name": nb_vm.name,
+            "netbox_cluster": nb_vm.cluster.name if nb_vm.cluster else "",
+            "netbox_status": str(getattr(nb_vm.status, "value", nb_vm.status)),
+        }
+
+        if nb_vm.tenant:
+            metadata["netbox_tenant"] = nb_vm.tenant.name
+        if nb_vm.role:
+            metadata["netbox_role"] = nb_vm.role.name
+        if nb_vm.vcpus is not None:
+            metadata["netbox_vcpus"] = str(nb_vm.vcpus)
+        if nb_vm.memory is not None:
+            metadata["netbox_memory_mb"] = str(nb_vm.memory)
+        if nb_vm.disk is not None:
+            metadata["netbox_disk_mb"] = str(nb_vm.disk)
+
+        kubespray_groups = cls._normalize_metadata_value("kubespray_groups", cls._vm_cf_value(nb_vm, "kubespray_groups"))
+        if kubespray_groups:
+            metadata["kubespray_groups"] = kubespray_groups
+
+        ssh_user = cls._metadata_scalar(cls._vm_cf_value(nb_vm, "ssh_user"))
+        if ssh_user:
+            metadata["ssh_user"] = ssh_user
+
+        use_access_ip = cls._metadata_scalar(cls._vm_cf_value(nb_vm, "user_access_ip"))
+        if use_access_ip:
+            metadata["use_access_ip"] = use_access_ip
+
+        return metadata
+
+    @classmethod
+    def desired_server_status(cls, nb_vm):
+        status_value = str(getattr(nb_vm.status, "value", nb_vm.status)).lower()
+        if status_value == "offline":
+            return "SHUTOFF"
+        return "ACTIVE"
+
+    def load(self, resource):
+        self.resource = resource
+        self.raw = self._resource_data(resource)
+
+        self.id = self._metadata_scalar(self._get_attr(self.raw, "id"))
+        self.name = self._metadata_scalar(self._get_attr(self.raw, "name"))
+        self.status = self._metadata_scalar(self._get_attr(self.raw, "status"))
+        self.project_id = self._metadata_scalar(
+            self._get_attr(
+                self.raw,
+                "project_id",
+                "tenant_id",
+                "location.project.id",
+                "location.project_id",
+                "project.id",
+            )
+        )
+        self.project_name = self._metadata_scalar(
+            self._get_attr(self.raw, "location.project.name", "project.name")
+        )
+        self.project_domain_id = self._metadata_scalar(
+            self._get_attr(self.raw, "location.project.domain_id", "project.domain_id")
+        )
+        self.availability_zone = self._metadata_scalar(
+            self._get_attr(self.raw, "availability_zone", "OS-EXT-AZ:availability_zone")
+        )
+        self.host = self._metadata_scalar(self._get_attr(self.raw, "host"))
+        self.host_id = self._metadata_scalar(self._get_attr(self.raw, "host_id", "hostId"))
+        self.hostname = self._metadata_scalar(self._get_attr(self.raw, "hostname", "OS-EXT-SRV-ATTR:hostname"))
+        self.hypervisor_hostname = self._metadata_scalar(self._get_attr(self.raw, "hypervisor_hostname"))
+        self.key_name = self._metadata_scalar(self._get_attr(self.raw, "key_name"))
+        self.launched_at = self._metadata_scalar(self._get_attr(self.raw, "launched_at", "OS-SRV-USG:launched_at"))
+        self.created_at = self._metadata_scalar(self._get_attr(self.raw, "created", "created_at"))
+        self.updated_at = self._metadata_scalar(self._get_attr(self.raw, "updated", "updated_at"))
+        self.terminated_at = self._metadata_scalar(self._get_attr(self.raw, "OS-SRV-USG:terminated_at", "terminated_at"))
+        self.access_ipv4 = self._metadata_scalar(self._get_attr(self.raw, "accessIPv4", "access_ipv4"))
+        self.access_ipv6 = self._metadata_scalar(self._get_attr(self.raw, "accessIPv6", "access_ipv6"))
+        self.description = self._metadata_scalar(self._get_attr(self.raw, "description"))
+        self.progress = self._metadata_scalar(self._get_attr(self.raw, "progress"))
+        self.config_drive = self._metadata_scalar(self._get_attr(self.raw, "config_drive"))
+        self.locked = self._metadata_scalar(self._get_attr(self.raw, "locked"))
+        self.locked_reason = self._metadata_scalar(self._get_attr(self.raw, "locked_reason"))
+        self.task_state = self._metadata_scalar(self._get_attr(self.raw, "OS-EXT-STS:task_state", "task_state"))
+        self.vm_state = self._metadata_scalar(self._get_attr(self.raw, "OS-EXT-STS:vm_state", "vm_state"))
+        self.power_state = self._metadata_scalar(self._get_attr(self.raw, "OS-EXT-STS:power_state", "power_state"))
+        self.addresses = self._get_attr(self.raw, "addresses") or {}
+        self.server_groups = self._get_attr(self.raw, "server_groups") or []
+        self.tags = self._get_attr(self.raw, "tags") or []
+
+        flavor = self._get_attr(self.raw, "flavor") or {}
+        self.flavor = {
+            "id": self._metadata_scalar(self._get_attr(flavor, "id")),
+            "name": self._metadata_scalar(self._get_attr(flavor, "original_name", "name", "id")),
+            "vcpus": self._get_attr(flavor, "vcpus"),
+            "ram": self._get_attr(flavor, "ram"),
+            "disk": self._get_attr(flavor, "disk"),
+            "ephemeral": self._get_attr(flavor, "ephemeral"),
+            "swap": self._get_attr(flavor, "swap"),
+            "extra_specs": self._get_attr(flavor, "extra_specs") or {},
+        }
+        self.flavor_id = self.flavor["id"]
+        self.flavor_name = self.flavor["name"]
+
+        location = self._get_attr(self.raw, "location") or {}
+        self.location = {
+            "cloud": self._metadata_scalar(self._get_attr(location, "cloud")),
+            "region": self._metadata_scalar(self._get_attr(location, "region_name", "region")),
+            "zone": self._metadata_scalar(self._get_attr(location, "zone")),
+        }
+        self.location_cloud = self.location["cloud"]
+        self.location_region = self.location["region"]
+        self.location_zone = self.location["zone"]
+
+        self.metadata = dict(self._get_attr(self.raw, "metadata") or {})
+        self.kubespray_groups = self._normalize_metadata_value("kubespray_groups", self.metadata.get("kubespray_groups"))
+        self.ssh_user = self._metadata_scalar(self.metadata.get("ssh_user"))
+        self.use_access_ip = self._metadata_scalar(self.metadata.get("use_access_ip"))
+        self.security_groups = self._security_group_names(self._get_attr(self.raw, "security_groups"))
+
+        self.openstack_id = self.id
+        return self
+
+    def refresh(self):
+        if self.id:
+            resource = self.conn.compute.get_server(self.id)
+            if resource is not None:
+                self.load(resource)
+        return self
+
+    def ref(self):
+        return self._os_server_ref(self)
+
+    def snapshot(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "status": self.status,
+            "project_id": self.project_id,
+            "project_name": self.project_name,
+            "project_domain_id": self.project_domain_id,
+            "availability_zone": self.availability_zone,
+            "host": self.host,
+            "host_id": self.host_id,
+            "hostname": self.hostname,
+            "hypervisor_hostname": self.hypervisor_hostname,
+            "key_name": self.key_name,
+            "launched_at": self.launched_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "terminated_at": self.terminated_at,
+            "access_ipv4": self.access_ipv4,
+            "access_ipv6": self.access_ipv6,
+            "description": self.description,
+            "progress": self.progress,
+            "config_drive": self.config_drive,
+            "locked": self.locked,
+            "locked_reason": self.locked_reason,
+            "task_state": self.task_state,
+            "vm_state": self.vm_state,
+            "power_state": self.power_state,
+            "location": dict(self.location),
+            "flavor": dict(self.flavor),
+            "security_groups": list(self.security_groups),
+            "server_groups": list(self.server_groups) if isinstance(self.server_groups, (list, tuple, set)) else self.server_groups,
+            "tags": list(self.tags) if isinstance(self.tags, (list, tuple, set)) else self.tags,
+            "addresses": self.addresses,
+            "metadata": dict(self.metadata),
+            "kubespray_groups": self.kubespray_groups,
+            "ssh_user": self.ssh_user,
+            "use_access_ip": self.use_access_ip,
+        }
+
+    def log_snapshot(self, log_debug, nb_vm):
+        if log_debug is None:
+            return
+        log_debug(
+            f"Parsed OpenStack resource snapshot for {self.ref()} and {self._nb_vm_ref(nb_vm)}:\n"
+            f"```json\n{json.dumps(self.snapshot(), indent=2, sort_keys=True)}\n```",
+            obj=nb_vm,
+        )
+
+    @classmethod
+    def _normalize_metadata_value(cls, field_name, value):
+        if value is None or value == "":
+            return ""
+
+        if field_name == "kubespray_groups":
+            if isinstance(value, (list, tuple, set)):
+                raw_values = value
+            else:
+                raw_values = str(value).split(",")
+
+            normalized_values = [str(entry).strip() for entry in raw_values if str(entry).strip()]
+            return ",".join(normalized_values)
+
+        return cls._metadata_scalar(value)
+
+    def update_name(self, desired_name, commit, change_rows=None, record_change=None, nb_vm=None):
+        change_rows = change_rows or []
+        current_name = self.name or ""
+        if current_name == desired_name:
+            return False
+
+        if record_change is not None and nb_vm is not None:
+            record_change(
+                change_rows,
+                nb_vm,
+                self,
+                "rename",
+                "name",
+                current_name or "<empty>",
+                desired_name,
+                commit,
+            )
+
+        if commit:
+            updated = self.conn.compute.update_server(self.resource, name=desired_name)
+            if updated is not None:
+                self.load(updated)
+            else:
+                self.name = desired_name
+                if isinstance(self.raw, dict):
+                    self.raw["name"] = desired_name
+                if isinstance(self.resource, dict):
+                    self.resource["name"] = desired_name
+        else:
+            self.name = desired_name
+
+        return True
+
+    def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None, sync_debug=False, log_debug=None):
+        change_rows = change_rows or []
+        current_metadata = dict(self.metadata)
+
+        if sync_debug and log_debug is not None and nb_vm is not None:
+            log_debug(
+                f"Retrieved metadata for {self.ref()} and {self._nb_vm_ref(nb_vm)}:\n"
+                f"```json\n{json.dumps(current_metadata, indent=2, sort_keys=True)}\n```",
+                obj=nb_vm,
+            )
+            self.log_snapshot(log_debug, nb_vm)
+
+        pending = {}
+        for key, value in desired_metadata.items():
+            current_value = current_metadata.get(key)
+            current_normalized = self._normalize_metadata_value(key, current_value)
+            desired_normalized = self._normalize_metadata_value(key, value)
+
+            if current_normalized == desired_normalized:
+                if sync_debug and log_debug is not None and nb_vm is not None:
+                    log_debug(
+                        f"Metadata {key} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
+                        obj=nb_vm,
+                    )
+                continue
+
+            pending[key] = desired_normalized
+            if record_change is not None and nb_vm is not None:
+                record_change(
+                    change_rows,
+                    nb_vm,
+                    self,
+                    "metadata",
+                    key,
+                    current_normalized,
+                    desired_normalized,
+                    commit,
+                )
+
+        if not pending:
+            return False
+
+        if commit:
+            merged_metadata = dict(current_metadata)
+            merged_metadata.update(pending)
+            self.conn.compute.set_server_metadata(self.resource, **merged_metadata)
+            self.metadata = merged_metadata
+            self.kubespray_groups = self._normalize_metadata_value("kubespray_groups", merged_metadata.get("kubespray_groups"))
+            self.ssh_user = self._metadata_scalar(merged_metadata.get("ssh_user"))
+            self.use_access_ip = self._metadata_scalar(merged_metadata.get("use_access_ip"))
+            if isinstance(self.raw, dict):
+                self.raw["metadata"] = merged_metadata
+            if isinstance(self.resource, dict):
+                self.resource["metadata"] = merged_metadata
+
+        return True
+
+    def sync_power_state(self, desired_status, commit, change_rows=None, record_change=None, nb_vm=None):
+        change_rows = change_rows or []
+        actual = self._metadata_scalar(self.status).upper()
+
+        if desired_status == "ACTIVE" and actual == "SHUTOFF":
+            if record_change is not None and nb_vm is not None:
+                record_change(
+                    change_rows,
+                    nb_vm,
+                    self,
+                    "power",
+                    "status",
+                    actual,
+                    desired_status,
+                    commit,
+                    details="start_server",
+                )
+            if commit:
+                self.conn.compute.start_server(self.resource)
+                self.status = desired_status
+                if isinstance(self.raw, dict):
+                    self.raw["status"] = desired_status
+            return True
+
+        if desired_status == "SHUTOFF" and actual == "ACTIVE":
+            if record_change is not None and nb_vm is not None:
+                record_change(
+                    change_rows,
+                    nb_vm,
+                    self,
+                    "power",
+                    "status",
+                    actual,
+                    desired_status,
+                    commit,
+                    details="stop_server",
+                )
+            if commit:
+                self.conn.compute.stop_server(self.resource)
+                self.status = desired_status
+                if isinstance(self.raw, dict):
+                    self.raw["status"] = desired_status
+            return True
+
+        return False
+
+
 class SyncNetBoxVMsToOpenStack(Script):
     class Meta:
         name = "Sync NetBox VMs to OpenStack"
@@ -354,149 +892,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             return "<empty>"
         return str(value)
 
-    def _get_attr(self, obj, *paths):
-        for path in paths:
-            current = obj
-            for part in path.split("."):
-                if current is None:
-                    break
-                if isinstance(current, dict):
-                    current = current.get(part)
-                else:
-                    current = getattr(current, part, None)
-            if current not in (None, "", []):
-                return current
-        return None
-
-    def _metadata_scalar(self, value):
-        if value in (None, ""):
-            return ""
-
-        if isinstance(value, dict):
-            for key in ("name", "value", "label", "display", "slug", "id"):
-                nested = value.get(key)
-                if nested not in (None, ""):
-                    return str(nested).strip()
-            return json.dumps(value, sort_keys=True)
-
-        if isinstance(value, (list, tuple, set)):
-            parts = [self._metadata_scalar(item) for item in value]
-            parts = [item for item in parts if item]
-            return ",".join(parts)
-
-        if hasattr(value, "name") and getattr(value, "name", None) not in (None, ""):
-            return str(getattr(value, "name")).strip()
-
-        return str(value).strip()
-
-    def _security_group_names(self, groups):
-        if groups in (None, ""):
-            return ""
-
-        names = []
-        for group in groups if isinstance(groups, (list, tuple, set)) else [groups]:
-            name = self._metadata_scalar(self._get_attr(group, "name") if not isinstance(group, str) else group)
-            if name:
-                names.append(name)
-
-        if not names:
-            return ""
-
-        deduped = []
-        seen = set()
-        for name in names:
-            normalized = name.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            deduped.append(name)
-
-        return ",".join(sorted(deduped, key=str.lower))
-
-    def _desired_k8s_cluster_name(self, nb_vm):
-        key_name = self._metadata_scalar(self._get_vm_cf_value(nb_vm, "key_name"))
-        if key_name.startswith("kubernetes-"):
-            return key_name.removeprefix("kubernetes-") or ""
-
-        raw_cluster = self._get_vm_cf_value(nb_vm, "k8s_cluster")
-        return self._metadata_scalar(raw_cluster)
-
-    def _current_openstack_value(self, os_server, current_metadata, field_name):
-        if field_name in {
-            "netbox_vm_id",
-            "netbox_vm_name",
-            "netbox_cluster",
-            "netbox_status",
-            "netbox_tenant",
-            "netbox_role",
-            "netbox_vcpus",
-            "netbox_memory_mb",
-            "netbox_disk_mb",
-            "ssh_user",
-            "use_access_ip",
-        }:
-            return self._metadata_scalar(current_metadata.get(field_name))
-
-        if field_name == "hostname":
-            return self._metadata_scalar(self._get_attr(os_server, "hostname", "OS-EXT-SRV-ATTR:hostname"))
-
-        if field_name == "kubespray_groups":
-            return self._normalize_metadata_value(field_name, current_metadata.get(field_name))
-
-        if field_name == "openstack_project_id":
-            return self._metadata_scalar(
-                self._get_attr(
-                    os_server,
-                    "project_id",
-                    "tenant_id",
-                    "location.project.id",
-                    "location.project_id",
-                    "project.id",
-                )
-            )
-
-        if field_name == "openstack_project_name":
-            return self._metadata_scalar(
-                self._get_attr(
-                    os_server,
-                    "location.project.name",
-                    "project.name",
-                )
-            )
-
-        if field_name == "openstack_availability_zone":
-            return self._metadata_scalar(self._get_attr(os_server, "availability_zone", "OS-EXT-AZ:availability_zone"))
-
-        if field_name == "openstack_host_id":
-            return self._metadata_scalar(self._get_attr(os_server, "host_id", "hostId"))
-
-        if field_name == "openstack_location_cloud":
-            return self._metadata_scalar(self._get_attr(os_server, "location.cloud"))
-
-        if field_name == "openstack_location_region":
-            return self._metadata_scalar(self._get_attr(os_server, "location.region_name", "location.region"))
-
-        if field_name == "openstack_location_zone":
-            return self._metadata_scalar(self._get_attr(os_server, "location.zone"))
-
-        if field_name == "openstack_flavor":
-            flavor = self._get_attr(os_server, "flavor")
-            return self._metadata_scalar(self._get_attr(flavor, "original_name", "name", "id"))
-
-        if field_name == "openstack_security_groups":
-            return self._security_group_names(self._get_attr(os_server, "security_groups"))
-
-        if field_name == "key_name":
-            return self._metadata_scalar(self._get_attr(os_server, "key_name"))
-
-        if field_name == "k8s_cluster":
-            key_name = self._metadata_scalar(self._get_attr(os_server, "key_name"))
-            if key_name.startswith("kubernetes-"):
-                return key_name.removeprefix("kubernetes-") or ""
-            return self._metadata_scalar(current_metadata.get(field_name))
-
-        return self._metadata_scalar(current_metadata.get(field_name))
-
     def _markdown_cell(self, value):
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
@@ -572,11 +967,13 @@ class SyncNetBoxVMsToOpenStack(Script):
 
     def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False):
         change_rows = []
-        os_server = self._find_server_for_vm(conn, nb_vm)
+        os_instance = OpenStackInstance.retrieve(conn, nb_vm, log_debug=self.log_debug)
         nb_vm_ref = self._nb_vm_ref(nb_vm)
         desired_name = nb_vm.name
+        desired_metadata = OpenStackInstance.desired_metadata(nb_vm)
+        desired_status = OpenStackInstance.desired_server_status(nb_vm)
 
-        if os_server is None:
+        if os_instance is None:
             self.log_info(f"No matching OpenStack server found for {nb_vm_ref}", obj=nb_vm)
             if not data.get("allow_create"):
                 self.log_warning(
@@ -613,99 +1010,113 @@ class SyncNetBoxVMsToOpenStack(Script):
                 self._log_change_summary(nb_vm, None, change_rows, commit)
                 return "created"
 
-            os_server = self._create_server(
+            os_instance = OpenStackInstance.create(
                 conn,
                 nb_vm,
-                data,
                 image,
                 flavor,
                 network,
-                change_rows=change_rows,
-                sync_debug=sync_debug,
+                key_name=self._get_vm_cf_value(nb_vm, "key_name"),
+                availability_zone=self._get_vm_cf_first(nb_vm, "openstack_availability_zone") or self._get_vm_cf_value(nb_vm, "openstack_location_zone"),
+                security_groups=self._get_vm_cf_list(nb_vm, "openstack_security_groups"),
+                metadata=desired_metadata,
+                wait_for_active=data.get("wait_for_active", True),
             )
             self._record_change(
                 change_rows,
                 nb_vm,
-                os_server,
+                os_instance,
                 "create",
                 "instance",
                 "<missing>",
-                os_server.name or nb_vm.name,
+                os_instance.name or nb_vm.name,
                 commit,
                 details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
             )
             existing_openstack_id = self._get_vm_openstack_id(nb_vm)
-            if existing_openstack_id != str(os_server.id):
+            if existing_openstack_id != str(os_instance.id):
                 self._record_change(
                     change_rows,
                     nb_vm,
-                    os_server,
+                    os_instance,
                     "identity",
                     "openstack_id",
                     existing_openstack_id,
-                    os_server.id,
+                    os_instance.id,
                     commit,
                 )
-                self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
-            self._log_change_summary(nb_vm, os_server, change_rows, commit)
+                self._update_vm_openstack_id(nb_vm, os_instance.id, commit=True)
+            if data.get("update_metadata"):
+                os_instance.sync_metadata(
+                    desired_metadata,
+                    commit=commit,
+                    change_rows=change_rows,
+                    record_change=self._record_change,
+                    nb_vm=nb_vm,
+                    sync_debug=sync_debug,
+                    log_debug=self.log_debug,
+                )
+            if data.get("sync_power_state"):
+                os_instance.sync_power_state(
+                    desired_status,
+                    commit=commit,
+                    change_rows=change_rows,
+                    record_change=self._record_change,
+                    nb_vm=nb_vm,
+                )
+            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
             return "created"
 
-        os_server_ref = self._os_server_ref(os_server)
+        os_server_ref = os_instance.ref()
         changed = False
 
         openstack_id = self._get_vm_openstack_id(nb_vm)
-        if openstack_id != str(os_server.id):
+        if openstack_id != str(os_instance.id):
             changed = True
             self._record_change(
                 change_rows,
                 nb_vm,
-                os_server,
+                os_instance,
                 "identity",
                 "openstack_id",
                 openstack_id,
-                os_server.id,
+                os_instance.id,
                 commit,
             )
             if commit:
-                self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
+                self._update_vm_openstack_id(nb_vm, os_instance.id, commit=True)
 
-        if data.get("allow_rename") and (os_server.name or "") != desired_name:
-            changed = True
-            self._record_change(
-                change_rows,
-                nb_vm,
-                os_server,
-                "rename",
-                "name",
-                os_server.name or "<empty>",
+        if data.get("allow_rename"):
+            changed = os_instance.update_name(
                 desired_name,
-                commit,
-            )
-            if commit:
-                os_server = conn.compute.update_server(os_server, name=desired_name)
-                os_server_ref = self._os_server_ref(os_server)
+                commit=commit,
+                change_rows=change_rows,
+                record_change=self._record_change,
+                nb_vm=nb_vm,
+            ) or changed
 
         if data.get("update_metadata"):
-            changed = self._sync_metadata(
-                conn,
-                os_server,
-                nb_vm,
-                commit,
+            changed = os_instance.sync_metadata(
+                desired_metadata,
+                commit=commit,
                 change_rows=change_rows,
+                record_change=self._record_change,
+                nb_vm=nb_vm,
                 sync_debug=sync_debug,
+                log_debug=self.log_debug,
             ) or changed
 
         if data.get("sync_power_state"):
-            changed = self._sync_power_state(
-                conn,
-                os_server,
-                nb_vm,
-                commit,
+            changed = os_instance.sync_power_state(
+                desired_status,
+                commit=commit,
                 change_rows=change_rows,
+                record_change=self._record_change,
+                nb_vm=nb_vm,
             ) or changed
 
         if change_rows:
-            self._log_change_summary(nb_vm, os_server, change_rows, commit)
+            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
@@ -873,272 +1284,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             "flavor": flavor,
             "network": network,
         }
-
-    def _find_server_for_vm(self, conn, nb_vm):
-        openstack_id = self._get_vm_openstack_id(nb_vm)
-        if openstack_id:
-            os_server = conn.compute.find_server(openstack_id, ignore_missing=True)
-            self.log_debug(
-                f"Looking up OpenStack server by openstack_id={openstack_id!r}"
-                f"for {self._nb_vm_ref(nb_vm)}: "
-                f"{'found ' + self._os_server_ref(os_server) if os_server else 'not found'}",
-                obj=nb_vm
-            )
-            if os_server is not None:
-                return os_server
-
-        serial = (nb_vm.serial or "").strip()
-        if serial:
-            os_server = conn.compute.find_server(serial, ignore_missing=True)
-            self.log_debug(
-                f"Looking up OpenStack server by serial={serial!r} for {self._nb_vm_ref(nb_vm)}: "
-                f"{'found ' + self._os_server_ref(os_server) if os_server else 'not found'}",
-                obj=nb_vm
-            )
-            if os_server is not None:
-                return os_server
-
-        try:
-            return conn.compute.find_server(nb_vm.name, ignore_missing=True)
-        except Exception:
-            return None
-
-    def _create_server(self, conn, nb_vm, data, image, flavor, network, change_rows=None, sync_debug=False):
-        create_args = {
-            "name": nb_vm.name,
-            "image_id": image.id,
-            "flavor_id": flavor.id,
-            "networks": [{"uuid": network.id}],
-        }
-
-        key_name = self._get_vm_cf_value(nb_vm, "key_name")
-        if key_name:
-            create_args["key_name"] = key_name
-
-        availability_zone = self._get_vm_cf_first(nb_vm, "openstack_availability_zone") or self._get_vm_cf_value(nb_vm, "openstack_location_zone")
-        if availability_zone:
-            create_args["availability_zone"] = availability_zone
-
-        security_groups = self._get_vm_cf_list(nb_vm, "openstack_security_groups")
-        if security_groups:
-            create_args["security_groups"] = [{"name": group_name} for group_name in security_groups]
-
-        os_server = conn.compute.create_server(**create_args)
-
-        if data.get("wait_for_active"):
-            os_server = conn.compute.wait_for_server(
-                os_server,
-                status="ACTIVE",
-                failures=["ERROR"],
-                wait=600,
-            )
-
-        if data.get("update_metadata"):
-            self._sync_metadata(
-                conn,
-                os_server,
-                nb_vm,
-                commit=True,
-                change_rows=change_rows,
-                sync_debug=sync_debug,
-            )
-
-        if data.get("sync_power_state"):
-            self._sync_power_state(
-                conn,
-                os_server,
-                nb_vm,
-                commit=True,
-                change_rows=change_rows,
-            )
-
-        return os_server
-
-    def _sync_metadata(self, conn, os_server, nb_vm, commit, change_rows=None, sync_debug=False):
-        if change_rows is None:
-            change_rows = []
-
-        desired_metadata = self._desired_metadata(nb_vm)
-        current_metadata_resource = conn.compute.get_server_metadata(os_server)
-        self.log_debug(
-            f"Raw metadata resource retrieved for {self._os_server_ref(os_server)} and {self._nb_vm_ref(nb_vm)}: "
-            f"{current_metadata_resource}",
-            obj=nb_vm,
-        )
-        current_metadata = getattr(current_metadata_resource, "metadata", {}) or {}
-
-        if sync_debug:
-            current_metadata_dump = json.dumps(current_metadata, indent=2, sort_keys=True)
-            self.log_debug(
-                f"Retrieved metadata for {self._os_server_ref(os_server)} and {self._nb_vm_ref(nb_vm)}:\n"
-                f"```json\n{current_metadata_dump}\n```",
-                obj=nb_vm,
-            )
-            parsed_snapshot_fields = (
-                "hostname",
-                "openstack_project_id",
-                "openstack_project_name",
-                "openstack_availability_zone",
-                "openstack_host_id",
-                "openstack_location_cloud",
-                "openstack_location_region",
-                "openstack_location_zone",
-                "openstack_flavor",
-                "openstack_security_groups",
-                "key_name",
-                "k8s_cluster",
-                "kubespray_groups",
-                "ssh_user",
-                "use_access_ip",
-            )
-            parsed_snapshot = {
-                field_name: self._current_openstack_value(os_server, current_metadata, field_name)
-                for field_name in parsed_snapshot_fields
-            }
-            self.log_debug(
-                f"Parsed OpenStack resource snapshot for {self._os_server_ref(os_server)} "
-                f"and {self._nb_vm_ref(nb_vm)}:\n"
-                f"```json\n{json.dumps(parsed_snapshot, indent=2, sort_keys=True)}\n```",
-                obj=nb_vm,
-            )
-
-        pending = {}
-        for key, value in desired_metadata.items():
-            current_value = current_metadata.get(key)
-            current_normalized = self._normalize_metadata_value(key, current_value)
-            desired_normalized = self._normalize_metadata_value(key, value)
-
-            if current_normalized == desired_normalized:
-                if sync_debug:
-                    self.log_debug(
-                        f"Metadata {key} already matches on {self._os_server_ref(os_server)} "
-                        f"for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
-                        obj=nb_vm,
-                    )
-                continue
-
-            pending[key] = desired_normalized
-            self._record_change(
-                change_rows,
-                nb_vm,
-                os_server,
-                "metadata",
-                key,
-                current_normalized,
-                desired_normalized,
-                commit,
-            )
-
-        if not pending:
-            return False
-
-        if commit:
-            merged_metadata = dict(current_metadata)
-            merged_metadata.update(pending)
-            conn.compute.set_server_metadata(os_server, **merged_metadata)
-        return True
-
-    def _normalize_metadata_value(self, field_name, value):
-        if value is None or value == "":
-            return ""
-
-        if field_name == "kubespray_groups":
-            if isinstance(value, (list, tuple, set)):
-                raw_values = value
-            else:
-                raw_values = str(value).split(",")
-
-            normalized_values = [str(entry).strip() for entry in raw_values if str(entry).strip()]
-            return ",".join(normalized_values)
-
-        return self._metadata_scalar(value)
-
-    def _desired_metadata(self, nb_vm):
-        metadata = {
-            "netbox_vm_id": str(nb_vm.pk),
-            "netbox_vm_name": nb_vm.name,
-            "netbox_cluster": nb_vm.cluster.name if nb_vm.cluster else "",
-            "netbox_status": str(getattr(nb_vm.status, "value", nb_vm.status)),
-        }
-
-        if nb_vm.tenant:
-            metadata["netbox_tenant"] = nb_vm.tenant.name
-        if nb_vm.role:
-            metadata["netbox_role"] = nb_vm.role.name
-        if nb_vm.vcpus is not None:
-            metadata["netbox_vcpus"] = str(nb_vm.vcpus)
-        if nb_vm.memory is not None:
-            metadata["netbox_memory_mb"] = str(nb_vm.memory)
-        if nb_vm.disk is not None:
-            metadata["netbox_disk_mb"] = str(nb_vm.disk)
-
-        field_map = (
-            ("kubespray_groups", ("kubespray_groups",)),
-            ("ssh_user", ("ssh_user",)),
-            ("use_access_ip", ("user_access_ip",)),
-            ("k8s_cluster", ("k8s_cluster",)),
-        )
-
-        for metadata_key, field_names in field_map:
-            if metadata_key == "k8s_cluster":
-                value = self._desired_k8s_cluster_name(nb_vm)
-            else:
-                value = None
-                for field_name in field_names:
-                    value = self._metadata_scalar(self._get_vm_cf_value(nb_vm, field_name))
-                    if value:
-                        break
-            if value:
-                metadata[metadata_key] = value
-
-        return metadata
-
-    def _sync_power_state(self, conn, os_server, nb_vm, commit, change_rows=None):
-        if change_rows is None:
-            change_rows = []
-
-        desired = self._desired_server_status(nb_vm)
-        actual = str(getattr(os_server, "status", "")).upper()
-
-        if desired == "ACTIVE" and actual == "SHUTOFF":
-            self._record_change(
-                change_rows,
-                nb_vm,
-                os_server,
-                "power",
-                "status",
-                actual,
-                desired,
-                commit,
-                details="start_server",
-            )
-            if commit:
-                conn.compute.start_server(os_server)
-            return True
-
-        if desired == "SHUTOFF" and actual == "ACTIVE":
-            self._record_change(
-                change_rows,
-                nb_vm,
-                os_server,
-                "power",
-                "status",
-                actual,
-                desired,
-                commit,
-                details="stop_server",
-            )
-            if commit:
-                conn.compute.stop_server(os_server)
-            return True
-
-        return False
-
-    def _desired_server_status(self, nb_vm):
-        status_value = str(getattr(nb_vm.status, "value", nb_vm.status)).lower()
-        if status_value == "offline":
-            return "SHUTOFF"
-        return "ACTIVE"
 
     def _get_vm_openstack_id(self, nb_vm):
         return self._get_vm_cf_value(nb_vm, "openstack_id") or (nb_vm.serial or "").strip()
