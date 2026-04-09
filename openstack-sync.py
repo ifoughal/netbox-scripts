@@ -8,6 +8,7 @@ the NetBox job log before optionally applying changes.
 import json
 import html
 from contextlib import contextmanager
+from decimal import Decimal
 import os
 import select
 import subprocess
@@ -40,23 +41,65 @@ METADATA_FIELDS_TO_SYNC = (
     ("netbox_status", "attr", "status.value", False),
     ("netbox_tenant", "attr", "tenant.name", False),
     ("netbox_role", "attr", "role.name", False),
-    ("netbox_vcpus", "attr", "vcpus", False),
-    ("netbox_memory_mb", "attr", "memory", False),
-    ("netbox_disk_mb", "attr", "disk", False),
     ("kubespray_groups", "cf", "kubespray_groups", False),
     ("ssh_user", "cf", "ssh_user", False),
     ("use_access_ip", "cf", "user_access_ip", False),
 )
 
-# OpenStack-side fields that are compared against NetBox values but are not
-# automatically mutated by this script. This keeps the summary useful for drift
-# detection without implying that every OpenStack attribute is writable.
-OPENSTACK_COMPARE_ONLY_FIELDS = (
-    ("flavor", "flavor.name", "cf", "openstack_flavor"),
-    ("availability_zone", "availability_zone", "cf_first", ("openstack_availability_zone", "openstack_location_zone")),
-    ("key_name", "key_name", "cf", "key_name"),
-    ("security_groups", "security_groups", "cf_list", "openstack_security_groups"),
-)
+# Field groups used by the comparison summary. `to_sync` values are sourced
+# from NetBox and should be treated as sync-tracked configuration, while
+# `report_only` values are checked for drift but are not written back.
+FIELD_GROUPS = {
+    "report_only": (
+        {
+            "field": "netbox_vcpus",
+            "openstack_path": "flavor.vcpus",
+            "source_kind": "attr",
+            "source_name": "vcpus",
+            "compare_kind": "size",
+        },
+        {
+            "field": "netbox_memory_mb",
+            "openstack_path": "flavor.ram",
+            "source_kind": "attr",
+            "source_name": "memory",
+            "compare_kind": "size",
+        },
+        {
+            "field": "netbox_disk_mb",
+            "openstack_path": "flavor.disk",
+            "source_kind": "attr",
+            "source_name": "disk",
+            "compare_kind": "size",
+        },
+    ),
+    "to_sync": (
+        {
+            "field": "flavor",
+            "openstack_path": "flavor.name",
+            "source_kind": "cf",
+            "source_name": "openstack_flavor",
+        },
+        {
+            "field": "availability_zone",
+            "openstack_path": "availability_zone",
+            "source_kind": "cf_first",
+            "source_name": ("openstack_availability_zone", "openstack_location_zone"),
+        },
+        {
+            "field": "key_name",
+            "openstack_path": "key_name",
+            "source_kind": "cf",
+            "source_name": "key_name",
+        },
+        {
+            "field": "security_groups",
+            "openstack_path": "security_groups",
+            "source_kind": "cf_list",
+            "source_name": "openstack_security_groups",
+        },
+    ),
+}
 
 
 class OpenStackInstance:
@@ -119,6 +162,23 @@ class OpenStackInstance:
             return str(getattr(value, "name")).strip()
 
         return str(value).strip()
+
+    @staticmethod
+    def _numeric_scalar(value):
+        """Normalize numeric values so equivalent quantities compare equally."""
+        if value in (None, ""):
+            return ""
+
+        try:
+            decimal_value = Decimal(str(value).strip())
+        except Exception:
+            return OpenStackInstance._metadata_scalar(value)
+
+        if decimal_value == decimal_value.to_integral():
+            return str(int(decimal_value))
+
+        normalized = format(decimal_value.normalize(), "f").rstrip("0").rstrip(".")
+        return normalized or "0"
 
     @staticmethod
     def _resource_data(resource):
@@ -504,69 +564,82 @@ class OpenStackInstance:
         raise ValueError(f"Unsupported metadata source kind: {source_kind}")
 
     @classmethod
-    def _normalize_compare_value(cls, field_name, value):
-        """Normalize compare-only field values so OpenStack and NetBox align."""
+    def _normalize_compare_value(cls, field_name, value, compare_kind=None):
+        """Normalize comparison values so OpenStack and NetBox align."""
+        if compare_kind == "size":
+            return cls._numeric_scalar(value)
         if field_name == "security_groups":
             return ",".join(cls._security_group_names(value))
         return cls._metadata_scalar(value)
 
-    def compare_report_only_fields(self, nb_vm, commit, change_rows=None, record_change=None, sync_debug=False, log_debug=None):
-        """Compare OpenStack-only attributes against NetBox and log any drift."""
+    def compare_field_groups(self, nb_vm, commit, change_rows=None, record_change=None, sync_debug=False, log_debug=None):
+        """Compare sync-tracked and report-only OpenStack fields against NetBox."""
         if change_rows is None:
             change_rows = []
 
         drift_found = False
-        for field_name, openstack_path, source_kind, source_name in OPENSTACK_COMPARE_ONLY_FIELDS:
-            desired_value = self._resolve_netbox_source_value(nb_vm, field_name, source_kind, source_name)
-            if desired_value in (None, "", []):
-                continue
+        for group_name, field_specs in FIELD_GROUPS.items():
+            change_type = group_name
+            mode = "sync" if group_name == "to_sync" else "report"
 
-            current_value = self._get_attr(self.__dict__, openstack_path)
-            current_normalized = self._normalize_compare_value(field_name, current_value)
-            desired_normalized = self._normalize_compare_value(field_name, desired_value)
+            for spec in field_specs:
+                field_name = spec["field"]
+                desired_value = self._resolve_netbox_source_value(
+                    nb_vm,
+                    field_name,
+                    spec["source_kind"],
+                    spec["source_name"],
+                )
+                if desired_value in (None, "", []):
+                    continue
 
-            if current_normalized == desired_normalized:
+                current_value = self._get_attr(self.__dict__, spec["openstack_path"])
+                compare_kind = spec.get("compare_kind")
+                current_normalized = self._normalize_compare_value(field_name, current_value, compare_kind)
+                desired_normalized = self._normalize_compare_value(field_name, desired_value, compare_kind)
+
+                if current_normalized == desired_normalized:
+                    if record_change is not None and nb_vm is not None:
+                        record_change(
+                            change_rows,
+                            nb_vm,
+                            self,
+                            change_type,
+                            field_name,
+                            current_normalized,
+                            desired_normalized,
+                            commit,
+                            details=group_name,
+                            state="matched",
+                            mode=mode,
+                        )
+                    if sync_debug and log_debug is not None and nb_vm is not None:
+                        log_debug(
+                            f"OpenStack field {field_name} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
+                            obj=nb_vm,
+                        )
+                    continue
+
+                drift_found = True
                 if record_change is not None and nb_vm is not None:
                     record_change(
                         change_rows,
                         nb_vm,
                         self,
-                        "compare",
+                        change_type,
                         field_name,
                         current_normalized,
                         desired_normalized,
                         commit,
-                        details="report_only",
-                        state="matched",
-                        mode="report",
+                        details=group_name,
+                        mode=mode,
                     )
                 if sync_debug and log_debug is not None and nb_vm is not None:
                     log_debug(
-                        f"OpenStack field {field_name} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
+                        f"OpenStack field {field_name} differs on {self.ref()} for {self._nb_vm_ref(nb_vm)}: "
+                        f"{current_normalized!r} != {desired_normalized!r}",
                         obj=nb_vm,
                     )
-                continue
-
-            drift_found = True
-            if record_change is not None and nb_vm is not None:
-                record_change(
-                    change_rows,
-                    nb_vm,
-                    self,
-                    "compare",
-                    field_name,
-                    current_normalized,
-                    desired_normalized,
-                    commit,
-                    details="report_only",
-                    mode="report",
-                )
-            if sync_debug and log_debug is not None and nb_vm is not None:
-                log_debug(
-                    f"OpenStack field {field_name} differs on {self.ref()} for {self._nb_vm_ref(nb_vm)}: "
-                    f"{current_normalized!r} != {desired_normalized!r}",
-                    obj=nb_vm,
-                )
 
         return drift_found
 
@@ -1147,7 +1220,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             "rename": 2,
             "metadata": 3,
             "power": 4,
-            "compare": 5,
+            "to_sync": 5,
+            "report_only": 6,
             "match": 99,
         }
         ordered_rows = sorted(
@@ -1158,13 +1232,19 @@ class SyncNetBoxVMsToOpenStack(Script):
         applied_change_count = sum(
             1
             for row in change_rows
-            if row.get("mode") != "report" and row.get("state", "changed") != "matched"
+            if row.get("mode") not in {"report", "sync"} and row.get("state", "changed") != "matched"
         )
+        to_sync_count = sum(1 for row in change_rows if row.get("mode") == "sync")
         report_only_count = sum(1 for row in change_rows if row.get("mode") == "report")
         comparison_count = len(change_rows)
         # Count every comparison row, even matched ones, so the summary proves
         # which fields were checked and which ones were only reported.
         comparison_suffix = f"{comparison_count} field comparison{'s' if comparison_count != 1 else ''}"
+        to_sync_suffix = (
+            f"{to_sync_count} to_sync comparison{'s' if to_sync_count != 1 else ''}"
+            if to_sync_count
+            else ""
+        )
         report_only_suffix = (
             f"{report_only_count} report-only comparison{'s' if report_only_count != 1 else ''}"
             if report_only_count
@@ -1172,6 +1252,8 @@ class SyncNetBoxVMsToOpenStack(Script):
         )
         if applied_change_count == 0:
             summary_suffix = f"(0 applied changes, {comparison_suffix}"
+            if to_sync_suffix:
+                summary_suffix += f", {to_sync_suffix}"
             if report_only_suffix:
                 summary_suffix += f", {report_only_suffix}"
             summary_suffix += ")"
@@ -1180,6 +1262,8 @@ class SyncNetBoxVMsToOpenStack(Script):
                 f"({applied_change_count} applied change{'s' if applied_change_count != 1 else ''}, "
                 f"{comparison_suffix}"
             )
+            if to_sync_suffix:
+                summary_suffix += f", {to_sync_suffix}"
             if report_only_suffix:
                 summary_suffix += f", {report_only_suffix}"
             summary_suffix += ")"
@@ -1319,9 +1403,9 @@ class SyncNetBoxVMsToOpenStack(Script):
                     record_change=self._record_change,
                     nb_vm=nb_vm,
                 )
-            # Compare-only fields are surfaced in the summary but are not
-            # automatically mutated by this script.
-            os_instance.compare_report_only_fields(
+            # Sync-tracked field comparisons are surfaced in the summary,
+            # while report-only checks cover flavor sizing drift.
+            os_instance.compare_field_groups(
                 nb_vm=nb_vm,
                 commit=commit,
                 change_rows=change_rows,
@@ -1398,16 +1482,16 @@ class SyncNetBoxVMsToOpenStack(Script):
                 nb_vm=nb_vm,
             ) or changed
 
-        # Compare-only fields are surfaced in the summary but are not
-        # automatically mutated by this script.
-        changed = os_instance.compare_report_only_fields(
+        # Sync-tracked field comparisons are surfaced in the summary, while
+        # report-only checks cover flavor sizing drift.
+        os_instance.compare_field_groups(
             nb_vm=nb_vm,
             commit=commit,
             change_rows=change_rows,
             record_change=self._record_change,
             sync_debug=sync_debug,
             log_debug=self.log_debug,
-        ) or changed
+        )
 
         self._log_change_summary(nb_vm, os_instance, change_rows, commit)
 
