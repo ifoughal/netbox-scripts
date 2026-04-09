@@ -49,6 +49,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 (
                     "allow_rename",
                     "update_metadata",
+                    "sync_debug",
                     "sync_power_state",
                 ),
             ),
@@ -118,6 +119,11 @@ class SyncNetBoxVMsToOpenStack(Script):
         default=True,
         description="Update OpenStack metadata from NetBox VM fields",
     )
+    sync_debug = BooleanVar(
+        required=False,
+        default=False,
+        description="Log unchanged metadata comparisons as debug output",
+    )
     sync_power_state = BooleanVar(
         required=False,
         default=False,
@@ -155,6 +161,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             raise AbortScript("openstacksdk is not installed in the NetBox Python environment") from exc
 
         with self._openvpn_tunnel(data.get("vpn_profile"), debug=bool(data.get("vpn_debug"))):
+            sync_debug = bool(data.get("sync_debug"))
             cluster = data["cluster"]
             tenant = data.get("tenant")
             name_prefix = (data.get("name_prefix") or "").strip()
@@ -188,6 +195,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                         nb_vm=nb_vm,
                         data=data,
                         commit=commit,
+                        sync_debug=sync_debug,
                     )
                     if result == "created":
                         created_count += 1
@@ -339,7 +347,91 @@ class SyncNetBoxVMsToOpenStack(Script):
         server_id = getattr(os_server, "id", None) or "<unknown>"
         return f"OpenStack server {server_name} (id={server_id})"
 
-    def _sync_vm(self, conn, nb_vm, data, commit):
+    def _summary_value(self, value):
+        if value in (None, ""):
+            return "<empty>"
+        return str(value)
+
+    def _markdown_cell(self, value):
+        return self._summary_value(value).replace("|", "\\|").replace("\n", " ")
+
+    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details=""):
+        openstack_text = self._summary_value(openstack_value)
+        netbox_text = self._summary_value(netbox_value)
+        change_rows.append(
+            {
+                "netbox_vm": self._nb_vm_ref(nb_vm),
+                "netbox_vm_id": str(nb_vm.pk),
+                "openstack_server": self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>",
+                "openstack_server_id": str(getattr(os_server, "id", None) or "<missing>"),
+                "change_type": change_type,
+                "field": field,
+                "openstack_value": openstack_text,
+                "netbox_value": netbox_text,
+                "diff": f"{openstack_text} -> {netbox_text}",
+                "details": details,
+                "mode": "apply" if commit else "dry-run",
+            }
+        )
+
+    def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
+        if not change_rows:
+            return
+
+        summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
+        headers = [
+            "VM",
+            "Server",
+            "Change",
+            "Field",
+            "OpenStack",
+            "NetBox",
+            "Diff",
+            "Mode",
+            "Details",
+        ]
+        table_rows = []
+        change_order = {
+            "create": 0,
+            "identity": 1,
+            "rename": 2,
+            "metadata": 3,
+            "power": 4,
+        }
+        ordered_rows = sorted(
+            enumerate(change_rows),
+            key=lambda item: (change_order.get(item[1]["change_type"], 99), item[0]),
+        )
+
+        for _, row in ordered_rows:
+            table_rows.append(
+                [
+                    row["netbox_vm"],
+                    row["openstack_server"],
+                    row["change_type"],
+                    row["field"],
+                    row["openstack_value"],
+                    row["netbox_value"],
+                    row["diff"],
+                    row["mode"],
+                    row["details"],
+                ]
+            )
+
+        lines = [
+            f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} "
+            f"({len(change_rows)} change{'s' if len(change_rows) != 1 else ''})",
+            "",
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join("---" for _ in headers) + " |",
+        ]
+        for row in table_rows:
+            lines.append("| " + " | ".join(self._markdown_cell(cell) for cell in row) + " |")
+
+        self.log_info("\n".join(lines), obj=nb_vm)
+
+    def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False):
+        change_rows = []
         os_server = self._find_server_for_vm(conn, nb_vm)
         nb_vm_ref = self._nb_vm_ref(nb_vm)
         desired_name = nb_vm.name
@@ -367,11 +459,55 @@ class SyncNetBoxVMsToOpenStack(Script):
                 self.log_info(create_message, obj=nb_vm)
             else:
                 self.log_info(f"[dry-run] {create_message}", obj=nb_vm)
+                self._record_change(
+                    change_rows,
+                    nb_vm,
+                    None,
+                    "create",
+                    "instance",
+                    "<missing>",
+                    nb_vm.name,
+                    commit,
+                    details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
+                )
+                self._log_change_summary(nb_vm, None, change_rows, commit)
                 return "created"
 
-            os_server = self._create_server(conn, nb_vm, data, image, flavor, network)
-            self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
-            self.log_success(f"Created {self._os_server_ref(os_server)} for {nb_vm_ref}", nb_vm)
+            os_server = self._create_server(
+                conn,
+                nb_vm,
+                data,
+                image,
+                flavor,
+                network,
+                change_rows=change_rows,
+                sync_debug=sync_debug,
+            )
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_server,
+                "create",
+                "instance",
+                "<missing>",
+                os_server.name or nb_vm.name,
+                commit,
+                details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
+            )
+            existing_openstack_id = self._get_vm_openstack_id(nb_vm)
+            if existing_openstack_id != str(os_server.id):
+                self._record_change(
+                    change_rows,
+                    nb_vm,
+                    os_server,
+                    "identity",
+                    "openstack_id",
+                    existing_openstack_id,
+                    os_server.id,
+                    commit,
+                )
+                self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
+            self._log_change_summary(nb_vm, os_server, change_rows, commit)
             return "created"
 
         os_server_ref = self._os_server_ref(os_server)
@@ -380,39 +516,56 @@ class SyncNetBoxVMsToOpenStack(Script):
         openstack_id = self._get_vm_openstack_id(nb_vm)
         if openstack_id != str(os_server.id):
             changed = True
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_server,
+                "identity",
+                "openstack_id",
+                openstack_id,
+                os_server.id,
+                commit,
+            )
             if commit:
-                self.log_info(
-                    f"Updating openstack_id on {nb_vm_ref} from {openstack_id or '<empty>'} "
-                    f"to {os_server.id} to match {os_server_ref}",
-                    obj=nb_vm,
-                )
                 self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
-                self.log_success(
-                    f"Updated openstack_id on {nb_vm_ref} to {os_server.id} using {os_server_ref}",
-                    nb_vm,
-                )
-            else:
-                self.log_info(
-                    f"[dry-run] Would update openstack_id on {nb_vm_ref} from {openstack_id or '<empty>'} "
-                    f"to {os_server.id} to match {os_server_ref}",
-                    obj=nb_vm,
-                )
 
         if data.get("allow_rename") and (os_server.name or "") != desired_name:
             changed = True
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_server,
+                "rename",
+                "name",
+                os_server.name or "<empty>",
+                desired_name,
+                commit,
+            )
             if commit:
-                self.log_info(f"Renaming {os_server_ref} to {desired_name} for {nb_vm_ref}", obj=nb_vm)
                 os_server = conn.compute.update_server(os_server, name=desired_name)
                 os_server_ref = self._os_server_ref(os_server)
-                self.log_success(f"Renamed {os_server_ref} to match {nb_vm_ref}", nb_vm)
-            else:
-                self.log_info(f"[dry-run] Would rename {os_server_ref} to {desired_name} for {nb_vm_ref}", obj=nb_vm)
 
         if data.get("update_metadata"):
-            changed = self._sync_metadata(conn, os_server, nb_vm, commit) or changed
+            changed = self._sync_metadata(
+                conn,
+                os_server,
+                nb_vm,
+                commit,
+                change_rows=change_rows,
+                sync_debug=sync_debug,
+            ) or changed
 
         if data.get("sync_power_state"):
-            changed = self._sync_power_state(conn, os_server, nb_vm, commit) or changed
+            changed = self._sync_power_state(
+                conn,
+                os_server,
+                nb_vm,
+                commit,
+                change_rows=change_rows,
+            ) or changed
+
+        if change_rows:
+            self._log_change_summary(nb_vm, os_server, change_rows, commit)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
@@ -599,7 +752,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         except Exception:
             return None
 
-    def _create_server(self, conn, nb_vm, data, image, flavor, network):
+    def _create_server(self, conn, nb_vm, data, image, flavor, network, change_rows=None, sync_debug=False):
         create_args = {
             "name": nb_vm.name,
             "image_id": image.id,
@@ -630,14 +783,30 @@ class SyncNetBoxVMsToOpenStack(Script):
             )
 
         if data.get("update_metadata"):
-            self._sync_metadata(conn, os_server, nb_vm, commit=True)
+            self._sync_metadata(
+                conn,
+                os_server,
+                nb_vm,
+                commit=True,
+                change_rows=change_rows,
+                sync_debug=sync_debug,
+            )
 
         if data.get("sync_power_state"):
-            self._sync_power_state(conn, os_server, nb_vm, commit=True)
+            self._sync_power_state(
+                conn,
+                os_server,
+                nb_vm,
+                commit=True,
+                change_rows=change_rows,
+            )
 
         return os_server
 
-    def _sync_metadata(self, conn, os_server, nb_vm, commit):
+    def _sync_metadata(self, conn, os_server, nb_vm, commit, change_rows=None, sync_debug=False):
+        if change_rows is None:
+            change_rows = []
+
         desired_metadata = self._desired_metadata(nb_vm)
         current_metadata_resource = conn.compute.get_server_metadata(os_server)
         current_metadata = getattr(current_metadata_resource, "metadata", {}) or {}
@@ -645,31 +814,55 @@ class SyncNetBoxVMsToOpenStack(Script):
         pending = {}
         for key, value in desired_metadata.items():
             current_value = current_metadata.get(key)
-            if current_value != value:
-                pending[key] = value
-                if commit:
+            current_normalized = self._normalize_metadata_value(key, current_value)
+            desired_normalized = self._normalize_metadata_value(key, value)
+
+            if current_normalized == desired_normalized:
+                if sync_debug:
                     self.log_info(
-                        f"Updating metadata {key} on {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}: "
-                        f"{current_value!r} -> {value!r}",
+                        f"[debug] Metadata {key} already matches on {self._os_server_ref(os_server)} "
+                        f"for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
                     )
-                else:
-                    self.log_info(
-                        f"[dry-run] Would update metadata {key} on {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}: "
-                        f"{current_value!r} -> {value!r}",
-                        obj=nb_vm,
-                    )
+                continue
+
+            pending[key] = desired_normalized
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_server,
+                "metadata",
+                key,
+                current_normalized,
+                desired_normalized,
+                commit,
+            )
 
         if not pending:
             return False
 
         if commit:
             conn.compute.set_server_metadata(os_server, **pending)
-            self.log_success(
-                f"Applied metadata updates to {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}",
-                nb_vm,
-            )
         return True
+
+    def _normalize_metadata_value(self, field_name, value):
+        if value is None or value == "":
+            return ""
+
+        if field_name == "kubespray_groups":
+            if isinstance(value, (list, tuple, set)):
+                raw_values = value
+            else:
+                raw_values = str(value).split(",")
+
+            normalized_values = [str(entry).strip() for entry in raw_values if str(entry).strip()]
+            return ",".join(normalized_values)
+
+        if isinstance(value, (list, tuple, set)):
+            normalized_values = [str(entry).strip() for entry in value if str(entry).strip()]
+            return ",".join(normalized_values)
+
+        return str(value).strip()
 
     def _desired_metadata(self, nb_vm):
         metadata = {
@@ -704,44 +897,43 @@ class SyncNetBoxVMsToOpenStack(Script):
 
         return metadata
 
-    def _sync_power_state(self, conn, os_server, nb_vm, commit):
+    def _sync_power_state(self, conn, os_server, nb_vm, commit, change_rows=None):
+        if change_rows is None:
+            change_rows = []
+
         desired = self._desired_server_status(nb_vm)
         actual = str(getattr(os_server, "status", "")).upper()
 
         if desired == "ACTIVE" and actual == "SHUTOFF":
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_server,
+                "power",
+                "status",
+                actual,
+                desired,
+                commit,
+                details="start_server",
+            )
             if commit:
-                self.log_info(
-                    f"Starting {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
-                    obj=nb_vm,
-                )
                 conn.compute.start_server(os_server)
-                self.log_success(
-                    f"Started {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}",
-                    nb_vm,
-                )
-            else:
-                self.log_info(
-                    f"[dry-run] Would start {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
-                    obj=nb_vm,
-                )
             return True
 
         if desired == "SHUTOFF" and actual == "ACTIVE":
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_server,
+                "power",
+                "status",
+                actual,
+                desired,
+                commit,
+                details="stop_server",
+            )
             if commit:
-                self.log_info(
-                    f"Stopping {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
-                    obj=nb_vm,
-                )
                 conn.compute.stop_server(os_server)
-                self.log_success(
-                    f"Stopped {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}",
-                    nb_vm,
-                )
-            else:
-                self.log_info(
-                    f"[dry-run] Would stop {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
-                    obj=nb_vm,
-                )
             return True
 
         return False
