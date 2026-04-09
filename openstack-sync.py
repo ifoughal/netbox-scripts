@@ -67,7 +67,7 @@ FIELD_GROUPS = {
         },
         {
             "field": "netbox_disk_mb",
-            "openstack_path": "flavor.disk",
+            "openstack_path": "flavor.total_disk_mb",
             "source_kind": "attr",
             "source_name": "disk",
             "compare_kind": "size",
@@ -179,6 +179,19 @@ class OpenStackInstance:
 
         normalized = format(decimal_value.normalize(), "f").rstrip("0").rstrip(".")
         return normalized or "0"
+
+    @staticmethod
+    def _flavor_total_disk_mb(disk_gb, ephemeral_gb):
+        """Return the flavor's total local disk allocation in megabytes."""
+        total_gb = Decimal("0")
+        for value in (disk_gb, ephemeral_gb):
+            if value in (None, ""):
+                continue
+            try:
+                total_gb += Decimal(str(value).strip())
+            except Exception:
+                continue
+        return int(total_gb * Decimal("1024"))
 
     @staticmethod
     def _resource_data(resource):
@@ -416,6 +429,7 @@ class OpenStackInstance:
             "disk": self._get_attr(flavor, "disk"),
             "ephemeral": self._get_attr(flavor, "ephemeral"),
             "swap": self._get_attr(flavor, "swap"),
+            "total_disk_mb": self._flavor_total_disk_mb(self._get_attr(flavor, "disk"), self._get_attr(flavor, "ephemeral")),
             "extra_specs": self._get_attr(flavor, "extra_specs") or {},
         }
         self.flavor_id = self.flavor["id"]
