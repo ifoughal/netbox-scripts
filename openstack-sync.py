@@ -209,8 +209,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             profile_path = Path(temp_dir) / "uploaded-profile.ovpn"
             self._write_uploaded_profile(uploaded_profile, profile_path)
 
-            self.log_info("sleeping for 5 minutes to allow for any transient OpenVPN connectivity issues to resolve before syncing")
-            time.sleep(300)
+            # self.log_info("sleeping for 5 minutes to allow for any transient OpenVPN connectivity issues to resolve before syncing")
+            # time.sleep(300)
 
             self.log_info(f"Starting OpenVPN tunnel from uploaded profile {getattr(uploaded_profile, 'name', profile_path.name)}")
             proc = self._start_openvpn(profile_path)
