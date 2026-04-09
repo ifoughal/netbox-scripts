@@ -915,10 +915,21 @@ class SyncNetBoxVMsToOpenStack(Script):
         )
 
     def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
+        summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         if not change_rows:
+            self.log_info(
+                f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} (0 changes)",
+                obj=nb_vm,
+            )
+            lines = [
+                "| Type | Field | OpenStack | NetBox | Diff | Mode | Details |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| summary | none | matched | matched | no changes | "
+                f"{'apply' if commit else 'dry-run'} | All evaluated fields already matched |",
+            ]
+            self.log_info("\n".join(lines), obj=nb_vm)
             return
 
-        summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         change_order = {
             "create": 0,
             "identity": 1,
@@ -1115,8 +1126,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 nb_vm=nb_vm,
             ) or changed
 
-        if change_rows:
-            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
