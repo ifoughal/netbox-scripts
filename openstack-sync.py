@@ -1257,8 +1257,10 @@ class SyncNetBoxVMsToOpenStack(Script):
             return "DRY-RUN"
         return "INFO"
 
-    def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
+    def _log_change_summary(self, nb_vm, os_server, change_rows, commit, sync_debug=False):
         """Render the accumulated comparison rows as a Markdown summary block."""
+        if not sync_debug:
+            return
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         if not change_rows:
             return
@@ -1478,7 +1480,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                     details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
                 )
                 self._log_change_report(nb_vm, None, change_rows, commit)
-                self._log_change_summary(nb_vm, None, change_rows, commit)
+                self._log_change_summary(nb_vm, None, change_rows, commit, sync_debug=sync_debug)
                 return "created"
 
             # In apply mode we create the instance after resolving its resources.
@@ -1548,7 +1550,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 log_debug=self.log_debug,
             )
             self._log_change_report(nb_vm, os_instance, change_rows, commit)
-            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+            self._log_change_summary(nb_vm, os_instance, change_rows, commit, sync_debug=sync_debug)
             return "created"
 
         os_server_ref = os_instance.ref()
@@ -1629,7 +1631,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         )
 
         self._log_change_report(nb_vm, os_instance, change_rows, commit)
-        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+        self._log_change_summary(nb_vm, os_instance, change_rows, commit, sync_debug=sync_debug)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
