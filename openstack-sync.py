@@ -1,3 +1,10 @@
+"""Synchronize NetBox virtual machines with OpenStack instances.
+
+The script resolves a matching OpenStack server for each selected NetBox VM,
+compares identity, metadata, and power state, then records the differences in
+the NetBox job log before optionally applying changes.
+"""
+
 import json
 import html
 from contextlib import contextmanager
@@ -16,7 +23,10 @@ from virtualization.models import Cluster, VirtualMachine
 
 
 class OpenStackInstance:
+    """Normalized view of an OpenStack server used by the sync workflow."""
+
     def __init__(self, conn, resource):
+        """Load a raw OpenStack resource and cache the normalized fields."""
         self.conn = conn
         self.resource = None
         self.raw = {}
@@ -24,16 +34,19 @@ class OpenStackInstance:
 
     @staticmethod
     def _nb_vm_ref(nb_vm):
+        """Return a stable human-readable label for a NetBox VM."""
         return f"NetBox VM {nb_vm.name} (id={nb_vm.pk})"
 
     @staticmethod
     def _os_server_ref(resource):
+        """Return a stable human-readable label for an OpenStack server."""
         server_name = getattr(resource, "name", None) or "<unnamed>"
         server_id = getattr(resource, "id", None) or "<unknown>"
         return f"OpenStack server {server_name} (id={server_id})"
 
     @staticmethod
     def _get_attr(obj, *paths):
+        """Return the first non-empty attribute or dictionary path that exists."""
         for path in paths:
             current = obj
             for part in path.split("."):
@@ -49,6 +62,7 @@ class OpenStackInstance:
 
     @staticmethod
     def _metadata_scalar(value):
+        """Flatten a metadata value into a comparable scalar string."""
         if value in (None, ""):
             return ""
 
@@ -71,6 +85,7 @@ class OpenStackInstance:
 
     @staticmethod
     def _resource_data(resource):
+        """Convert an OpenStack SDK resource into a plain dictionary."""
         if resource is None:
             return {}
         if isinstance(resource, dict):
@@ -86,6 +101,7 @@ class OpenStackInstance:
 
     @staticmethod
     def _security_group_names(groups):
+        """Normalize security group objects or names into sorted unique names."""
         if groups in (None, ""):
             return []
 
@@ -110,6 +126,7 @@ class OpenStackInstance:
 
     @staticmethod
     def _vm_cf_data(nb_vm):
+        """Return the NetBox VM custom field dictionary regardless of API shape."""
         data = getattr(nb_vm, "custom_field_data", None)
         if isinstance(data, dict):
             return data
@@ -120,6 +137,7 @@ class OpenStackInstance:
 
     @staticmethod
     def _vm_cf_value(nb_vm, field_name):
+        """Return a normalized custom field value from a NetBox VM."""
         value = OpenStackInstance._vm_cf_data(nb_vm).get(field_name)
         if value in (None, "", []):
             return None
@@ -129,6 +147,7 @@ class OpenStackInstance:
 
     @classmethod
     def retrieve(cls, conn, nb_vm, log_debug=None):
+        """Look up and wrap the matching OpenStack server for a NetBox VM."""
         resource = cls._find_resource_for_vm(conn, nb_vm, log_debug=log_debug)
         if resource is None:
             return None
@@ -136,6 +155,7 @@ class OpenStackInstance:
 
     @classmethod
     def _find_resource_for_vm(cls, conn, nb_vm, log_debug=None):
+        """Find the best matching OpenStack server using IDs, serial, then name."""
         openstack_id = cls._vm_cf_value(nb_vm, "openstack_id") or (nb_vm.serial or "").strip()
         if openstack_id:
             os_server = conn.compute.find_server(openstack_id, ignore_missing=True)
@@ -191,6 +211,7 @@ class OpenStackInstance:
         metadata=None,
         wait_for_active=True,
     ):
+        """Create a new OpenStack server from the supplied NetBox VM details."""
         create_args = {
             "name": nb_vm.name,
             "image_id": image.id,
@@ -220,6 +241,7 @@ class OpenStackInstance:
 
     @classmethod
     def desired_metadata(cls, nb_vm):
+        """Build the OpenStack metadata payload that should mirror the NetBox VM."""
         metadata = {
             "netbox_vm_id": str(nb_vm.pk),
             "netbox_vm_name": nb_vm.name,
@@ -254,15 +276,18 @@ class OpenStackInstance:
 
     @classmethod
     def desired_server_status(cls, nb_vm):
+        """Translate the NetBox VM status into the target OpenStack power state."""
         status_value = str(getattr(nb_vm.status, "value", nb_vm.status)).lower()
         if status_value == "offline":
             return "SHUTOFF"
         return "ACTIVE"
 
     def load(self, resource):
+        """Populate all cached fields from a raw OpenStack resource."""
         self.resource = resource
         self.raw = self._resource_data(resource)
 
+        # Read the fields we compare and log so later code can work with strings.
         self.id = self._metadata_scalar(self._get_attr(self.raw, "id"))
         self.name = self._metadata_scalar(self._get_attr(self.raw, "name"))
         self.status = self._metadata_scalar(self._get_attr(self.raw, "status"))
@@ -342,6 +367,7 @@ class OpenStackInstance:
         return self
 
     def refresh(self):
+        """Reload the OpenStack resource if we still have a server ID."""
         if self.id:
             resource = self.conn.compute.get_server(self.id)
             if resource is not None:
@@ -349,9 +375,11 @@ class OpenStackInstance:
         return self
 
     def ref(self):
+        """Return the canonical server label used in log output."""
         return self._os_server_ref(self)
 
     def snapshot(self):
+        """Return a JSON-serializable snapshot of the normalized server state."""
         return {
             "id": self.id,
             "name": self.name,
@@ -392,6 +420,7 @@ class OpenStackInstance:
         }
 
     def log_snapshot(self, log_debug, nb_vm):
+        """Emit the current server snapshot to the debug logger."""
         if log_debug is None:
             return
         log_debug(
@@ -402,6 +431,7 @@ class OpenStackInstance:
 
     @classmethod
     def _normalize_metadata_value(cls, field_name, value):
+        """Normalize metadata values so equality checks are stable."""
         if value is None or value == "":
             return ""
 
@@ -417,10 +447,13 @@ class OpenStackInstance:
         return cls._metadata_scalar(value)
 
     def update_name(self, desired_name, commit, change_rows=None, record_change=None, nb_vm=None):
+        """Rename the OpenStack server when the NetBox VM name differs."""
         if change_rows is None:
             change_rows = []
         current_name = self.name or ""
         if current_name == desired_name:
+            # Even matching values are recorded so the summary can show that the
+            # field was checked and found to be in sync.
             if record_change is not None and nb_vm is not None:
                 record_change(
                     change_rows,
@@ -452,11 +485,14 @@ class OpenStackInstance:
         return True
 
     def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None, sync_debug=False, log_debug=None):
+        """Compare, report, and optionally merge the NetBox metadata payload."""
         if change_rows is None:
             change_rows = []
         current_metadata = dict(self.metadata)
 
         if sync_debug and log_debug is not None and nb_vm is not None:
+            # Dump the raw metadata and normalized snapshot together when
+            # debugging so a mismatch can be traced quickly.
             log_debug(
                 f"Retrieved metadata for {self.ref()} and {self._nb_vm_ref(nb_vm)}:\n"
                 f"```json\n{json.dumps(current_metadata, indent=2, sort_keys=True)}\n```",
@@ -466,6 +502,8 @@ class OpenStackInstance:
 
         pending = {}
         for key, value in desired_metadata.items():
+            # Compare each desired key independently so the summary can show
+            # which fields were already aligned and which still need updates.
             current_value = current_metadata.get(key)
             current_normalized = self._normalize_metadata_value(key, current_value)
             desired_normalized = self._normalize_metadata_value(key, value)
@@ -505,9 +543,11 @@ class OpenStackInstance:
                 )
 
         if not pending:
+            # No updates are needed, but the matched rows remain in the summary.
             return False
 
         if commit:
+            # Merge only the changed keys when we are in apply mode.
             merged_metadata = dict(current_metadata)
             merged_metadata.update(pending)
             self.conn.compute.set_server_metadata(self.resource, **merged_metadata)
@@ -523,11 +563,13 @@ class OpenStackInstance:
         return True
 
     def sync_power_state(self, desired_status, commit, change_rows=None, record_change=None, nb_vm=None):
+        """Map NetBox status to OpenStack power state and record the result."""
         if change_rows is None:
             change_rows = []
         actual = self._metadata_scalar(self.status).upper()
 
         if desired_status == "ACTIVE" and actual == "SHUTOFF":
+            # NetBox wants the VM online, so request a start on OpenStack.
             if record_change is not None and nb_vm is not None:
                 record_change(
                     change_rows,
@@ -548,6 +590,7 @@ class OpenStackInstance:
             return True
 
         if desired_status == "SHUTOFF" and actual == "ACTIVE":
+            # NetBox wants the VM offline, so request a stop on OpenStack.
             if record_change is not None and nb_vm is not None:
                 record_change(
                     change_rows,
@@ -567,7 +610,8 @@ class OpenStackInstance:
                     self.raw["status"] = desired_status
             return True
 
-        if record_change is not None and nb_vm is not None:
+        # Record the aligned state so the summary shows the power check too.
+        if desired_status == actual and record_change is not None and nb_vm is not None:
             record_change(
                 change_rows,
                 nb_vm,
@@ -585,6 +629,8 @@ class OpenStackInstance:
 
 
 class SyncNetBoxVMsToOpenStack(Script):
+    """NetBox script that reconciles selected virtual machines into OpenStack."""
+
     class Meta:
         name = "Sync NetBox VMs to OpenStack"
         description = "Push NetBox virtual machine data into OpenStack instances. Leave Commit unchecked to run in dry-run mode."
@@ -721,6 +767,7 @@ class SyncNetBoxVMsToOpenStack(Script):
     )
 
     def run(self, data, commit):
+        """Sync every selected NetBox VM and return a compact job summary."""
         if commit:
             self.log_info("Running in apply mode: changes will be sent to OpenStack")
         else:
@@ -733,6 +780,7 @@ class SyncNetBoxVMsToOpenStack(Script):
 
         with self._openvpn_tunnel(data.get("vpn_profile"), debug=bool(data.get("vpn_debug"))):
             sync_debug = bool(data.get("sync_debug"))
+            # Build the NetBox queryset from the selected scope before iterating.
             cluster = data["cluster"]
             tenant = data.get("tenant")
             name_prefix = (data.get("name_prefix") or "").strip()
@@ -749,11 +797,13 @@ class SyncNetBoxVMsToOpenStack(Script):
                 return "No matching NetBox VMs found"
 
             connection_cache = {}
+            # Track the job outcome buckets so the final return string is useful.
             created_count = 0
             updated_count = 0
             unchanged_count = 0
             failed_count = 0
 
+            # Each VM gets reconciled independently so a failure does not stop the batch.
             for nb_vm in nb_vms:
                 try:
                     result = self._sync_vm(
@@ -789,6 +839,7 @@ class SyncNetBoxVMsToOpenStack(Script):
 
     @contextmanager
     def _openvpn_tunnel(self, uploaded_profile, debug=False):
+        """Bring up a temporary OpenVPN tunnel around the sync run."""
         if uploaded_profile is None:
             yield None
             return
@@ -803,6 +854,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 self._stop_openvpn(proc)
 
     def _write_uploaded_profile(self, uploaded_profile, profile_path):
+        """Write the uploaded VPN profile to disk with restrictive permissions."""
         if hasattr(uploaded_profile, "chunks"):
             with profile_path.open("wb") as handle:
                 for chunk in uploaded_profile.chunks():
@@ -818,9 +870,11 @@ class SyncNetBoxVMsToOpenStack(Script):
         profile_path.chmod(0o600)
 
     def _openvpn_binary(self):
+        """Return the OpenVPN executable to use for tunnel startup."""
         return (os.environ.get("OPENVPN_BINARY") or "openvpn").strip() or "openvpn"
 
     def _openvpn_start_timeout(self):
+        """Return the number of seconds to wait for the VPN tunnel to initialize."""
         raw_timeout = (os.environ.get("OPENVPN_START_TIMEOUT") or "90").strip()
         try:
             timeout = int(raw_timeout)
@@ -829,6 +883,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return max(timeout, 1)
 
     def _start_openvpn(self, profile_path, debug=False):
+        """Launch OpenVPN and wait until the tunnel reports readiness."""
         command = [
             self._openvpn_binary(),
             "--config",
@@ -837,6 +892,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             "3",
         ]
 
+        # Keep stdout attached so the script can surface startup failures.
         try:
             proc = subprocess.Popen(
                 command,
@@ -888,6 +944,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                             + (f". Last output: {line}" if line else "")
                         )
 
+            # Bail out if the tunnel never reaches a ready state.
             if time.monotonic() > deadline:
                 last_output = "\n".join(output[-20:])
                 self._stop_openvpn(proc)
@@ -897,6 +954,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 )
 
     def _stop_openvpn(self, proc):
+        """Terminate a running OpenVPN process, escalating to kill if needed."""
         if proc is None or proc.poll() is not None:
             return
 
@@ -911,22 +969,27 @@ class SyncNetBoxVMsToOpenStack(Script):
                 pass
 
     def _nb_vm_ref(self, nb_vm):
+        """Return a human-readable label for a NetBox VM."""
         return f"NetBox VM {nb_vm.name} (id={nb_vm.pk})"
 
     def _os_server_ref(self, os_server):
+        """Return a human-readable label for an OpenStack server."""
         server_name = getattr(os_server, "name", None) or "<unnamed>"
         server_id = getattr(os_server, "id", None) or "<unknown>"
         return f"OpenStack server {server_name} (id={server_id})"
 
     def _summary_value(self, value):
+        """Format a comparison value for inclusion in the summary table."""
         if value in (None, ""):
             return "<empty>"
         return str(value)
 
     def _markdown_cell(self, value):
+        """Escape a summary value so it remains valid inside a Markdown table."""
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
     def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details="", state="changed"):
+        """Append a single comparison row to the summary accumulator."""
         openstack_text = self._summary_value(openstack_value)
         netbox_text = self._summary_value(netbox_value)
         change_rows.append(
@@ -947,10 +1010,12 @@ class SyncNetBoxVMsToOpenStack(Script):
         )
 
     def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
+        """Render the accumulated comparison rows as a Markdown summary block."""
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         if not change_rows:
             return
 
+        # Group changes by type so the rendered table is easy to scan.
         change_order = {
             "create": 0,
             "identity": 1,
@@ -966,6 +1031,8 @@ class SyncNetBoxVMsToOpenStack(Script):
 
         actual_change_count = sum(1 for row in change_rows if row.get("state", "changed") != "matched")
         comparison_count = len(change_rows)
+        # Count every comparison row, even matched ones, so the summary proves
+        # which fields were checked and which ones actually changed.
         if actual_change_count == 0:
             summary_suffix = f"(0 changes, {comparison_count} field comparison{'s' if comparison_count != 1 else ''})"
         else:
@@ -1008,6 +1075,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         self.log_info("\n".join(lines), obj=nb_vm)
 
     def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False):
+        """Reconcile one NetBox VM against its matching OpenStack server."""
         change_rows = []
         os_instance = OpenStackInstance.retrieve(conn, nb_vm, log_debug=self.log_debug)
         nb_vm_ref = self._nb_vm_ref(nb_vm)
@@ -1016,6 +1084,8 @@ class SyncNetBoxVMsToOpenStack(Script):
         desired_status = OpenStackInstance.desired_server_status(nb_vm)
 
         if os_instance is None:
+            # The VM has no matching server, so either create it or report that
+            # creation is disabled for this run.
             self.log_info(f"No matching OpenStack server found for {nb_vm_ref}", obj=nb_vm)
             if not data.get("allow_create"):
                 self.log_warning(
@@ -1034,9 +1104,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 f"using image={image.name}, flavor={flavor.name}, network={network.name}"
             )
 
-            if commit:
-                self.log_info(create_message, obj=nb_vm)
-            else:
+            if not commit:
                 self.log_info(f"[dry-run] {create_message}", obj=nb_vm)
                 self._record_change(
                     change_rows,
@@ -1052,6 +1120,8 @@ class SyncNetBoxVMsToOpenStack(Script):
                 self._log_change_summary(nb_vm, None, change_rows, commit)
                 return "created"
 
+            # In apply mode we create the instance after resolving its resources.
+            self.log_info(create_message, obj=nb_vm)
             os_instance = OpenStackInstance.create(
                 conn,
                 nb_vm,
@@ -1112,6 +1182,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         os_server_ref = os_instance.ref()
         changed = False
 
+        # Keep the NetBox openstack_id in sync with the actual OpenStack server.
         openstack_id = self._get_vm_openstack_id(nb_vm)
         if openstack_id != str(os_instance.id):
             changed = True
@@ -1142,6 +1213,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             )
 
         if data.get("allow_rename"):
+            # Name changes are optional because some environments want stable
+            # OpenStack server names even when NetBox naming differs.
             changed = os_instance.update_name(
                 desired_name,
                 commit=commit,
@@ -1151,6 +1224,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             ) or changed
 
         if data.get("update_metadata"):
+            # Metadata sync is where most of the reconciliation happens.
             changed = os_instance.sync_metadata(
                 desired_metadata,
                 commit=commit,
@@ -1162,6 +1236,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             ) or changed
 
         if data.get("sync_power_state"):
+            # Power state is optional because some operators prefer manual control.
             changed = os_instance.sync_power_state(
                 desired_status,
                 commit=commit,
@@ -1179,6 +1254,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return "updated"
 
     def _build_openstack_conn_kwargs(self, data, region_name=None, project_id=None, project_name=None):
+        """Build the keyword arguments shared by every OpenStack connection."""
         conn_kwargs = {
             "auth_url": data["auth_url"].strip(),
             "username": data["username"].strip(),
@@ -1205,6 +1281,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return conn_kwargs
 
     def _get_base_connection(self, openstack, data, region_name, connection_cache):
+        """Return a cached base connection for the requested region."""
         base_key = ("__base__", region_name or "")
         cached = connection_cache.get(base_key)
         if cached is not None:
@@ -1220,6 +1297,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return base_conn
 
     def _resolve_project_resource(self, conn, project_id, project_name, nb_vm_name):
+        """Resolve a project object by ID first, then by name if needed."""
         lookup_error = None
 
         if project_id:
@@ -1248,6 +1326,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         raise AbortScript(f"Could not resolve OpenStack project {project_ref} for VM {nb_vm_name}")
 
     def _get_connection_for_vm(self, openstack, data, nb_vm, connection_cache):
+        """Return a cached project-scoped OpenStack connection for one VM."""
         project_id = self._get_vm_cf_value(nb_vm, "openstack_project_id")
         project_name = self._get_vm_cf_value(nb_vm, "openstack_project_name")
         region_name = self._get_vm_cf_value(nb_vm, "openstack_location_region")
@@ -1297,6 +1376,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return conn
 
     def _resolve_creation_resources(self, conn, data, nb_vm):
+        """Resolve the image, flavor, and network needed to create a server."""
         image_name = (
             self._get_vm_cf_value(nb_vm, "openstack_image")
             or self._get_vm_cf_value(nb_vm, "openstack_image_name")
@@ -1340,15 +1420,18 @@ class SyncNetBoxVMsToOpenStack(Script):
         }
 
     def _get_vm_openstack_id(self, nb_vm):
+        """Return the OpenStack server ID stored on the NetBox VM."""
         return self._get_vm_cf_value(nb_vm, "openstack_id") or (nb_vm.serial or "").strip()
 
     def _update_vm_openstack_id(self, nb_vm, server_id, commit):
+        """Persist the OpenStack server ID back onto the NetBox VM."""
         self._set_vm_cf_value(nb_vm, "openstack_id", str(server_id))
         nb_vm.serial = str(server_id)
         nb_vm.full_clean()
         nb_vm.save()
 
     def _get_vm_cf_data(self, nb_vm):
+        """Return the NetBox VM custom field dictionary in a version-agnostic way."""
         data = getattr(nb_vm, "custom_field_data", None)
         if isinstance(data, dict):
             return data
@@ -1358,6 +1441,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return {}
 
     def _get_vm_cf_value(self, nb_vm, field_name):
+        """Return a single custom field value, collapsing trivial one-item lists."""
         value = self._get_vm_cf_data(nb_vm).get(field_name)
         if value in (None, "", []):
             return None
@@ -1366,12 +1450,14 @@ class SyncNetBoxVMsToOpenStack(Script):
         return value
 
     def _get_vm_cf_first(self, nb_vm, field_name):
+        """Return the first item from a custom field value that may be a list."""
         value = self._get_vm_cf_data(nb_vm).get(field_name)
         if isinstance(value, list):
             return value[0] if value else None
         return value
 
     def _get_vm_cf_list(self, nb_vm, field_name):
+        """Return a custom field value as a filtered list."""
         value = self._get_vm_cf_data(nb_vm).get(field_name)
         if value in (None, ""):
             return []
@@ -1380,6 +1466,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return [value]
 
     def _set_vm_cf_value(self, nb_vm, field_name, value):
+        """Update the cached custom field data on the NetBox VM object."""
         data = dict(self._get_vm_cf_data(nb_vm))
         data[field_name] = value
         setattr(nb_vm, "custom_field_data", data)
