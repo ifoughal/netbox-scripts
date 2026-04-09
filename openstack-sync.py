@@ -1478,6 +1478,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                     details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
                 )
                 self._log_change_report(nb_vm, None, change_rows, commit)
+                self._log_change_summary(nb_vm, None, change_rows, commit)
                 return "created"
 
             # In apply mode we create the instance after resolving its resources.
@@ -1547,6 +1548,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 log_debug=self.log_debug,
             )
             self._log_change_report(nb_vm, os_instance, change_rows, commit)
+            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
             return "created"
 
         os_server_ref = os_instance.ref()
@@ -1627,6 +1629,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         )
 
         self._log_change_report(nb_vm, os_instance, change_rows, commit)
+        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
