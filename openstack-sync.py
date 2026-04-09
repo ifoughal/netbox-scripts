@@ -446,6 +446,13 @@ class OpenStackInstance:
 
         return cls._metadata_scalar(value)
 
+    @staticmethod
+    def _metadata_summary_skip_keys():
+        """Return metadata keys that are synced but hidden from comparison rows."""
+        # These values are already represented by dedicated sync paths, so
+        # logging them again only adds noise to the job summary.
+        return {"netbox_vm_id", "netbox_vm_name", "netbox_status"}
+
     def update_name(self, desired_name, commit, change_rows=None, record_change=None, nb_vm=None):
         """Rename the OpenStack server when the NetBox VM name differs."""
         if change_rows is None:
@@ -489,6 +496,7 @@ class OpenStackInstance:
         if change_rows is None:
             change_rows = []
         current_metadata = dict(self.metadata)
+        summary_skip_keys = self._metadata_summary_skip_keys()
 
         if sync_debug and log_debug is not None and nb_vm is not None:
             # Dump the raw metadata and normalized snapshot together when
@@ -509,7 +517,7 @@ class OpenStackInstance:
             desired_normalized = self._normalize_metadata_value(key, value)
 
             if current_normalized == desired_normalized:
-                if record_change is not None and nb_vm is not None:
+                if key not in summary_skip_keys and record_change is not None and nb_vm is not None:
                     record_change(
                         change_rows,
                         nb_vm,
@@ -522,7 +530,7 @@ class OpenStackInstance:
                         details="matched",
                         state="matched",
                     )
-                if sync_debug and log_debug is not None and nb_vm is not None:
+                if key not in summary_skip_keys and sync_debug and log_debug is not None and nb_vm is not None:
                     log_debug(
                         f"Metadata {key} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
@@ -530,7 +538,7 @@ class OpenStackInstance:
                 continue
 
             pending[key] = desired_normalized
-            if record_change is not None and nb_vm is not None:
+            if key not in summary_skip_keys and record_change is not None and nb_vm is not None:
                 record_change(
                     change_rows,
                     nb_vm,
@@ -1246,6 +1254,12 @@ class SyncNetBoxVMsToOpenStack(Script):
             ) or changed
 
         self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+
+        if changed and not change_rows:
+            self.log_info(
+                f"Updated derived metadata fields for {nb_vm_ref} against {os_server_ref}",
+                obj=nb_vm,
+            )
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
