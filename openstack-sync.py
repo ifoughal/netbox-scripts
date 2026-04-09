@@ -462,6 +462,7 @@ class OpenStackInstance:
             self.log_snapshot(log_debug, nb_vm)
 
         pending = {}
+        matched_rows = []
         for key, value in desired_metadata.items():
             current_value = current_metadata.get(key)
             current_normalized = self._normalize_metadata_value(key, current_value)
@@ -473,6 +474,7 @@ class OpenStackInstance:
                         f"Metadata {key} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
                     )
+                matched_rows.append((key, current_normalized, desired_normalized))
                 continue
 
             pending[key] = desired_normalized
@@ -489,6 +491,20 @@ class OpenStackInstance:
                 )
 
         if not pending:
+            if record_change is not None and nb_vm is not None:
+                for key, current_normalized, desired_normalized in matched_rows:
+                    record_change(
+                        change_rows,
+                        nb_vm,
+                        self,
+                        "metadata",
+                        key,
+                        current_normalized,
+                        desired_normalized,
+                        commit,
+                        details="matched",
+                        state="matched",
+                    )
             return False
 
         if commit:
@@ -895,7 +911,7 @@ class SyncNetBoxVMsToOpenStack(Script):
     def _markdown_cell(self, value):
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
-    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details=""):
+    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details="", state="changed"):
         openstack_text = self._summary_value(openstack_value)
         netbox_text = self._summary_value(netbox_value)
         change_rows.append(
@@ -910,6 +926,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 "netbox_value": netbox_text,
                 "diff": f"{openstack_text} -> {netbox_text}",
                 "details": details,
+                "state": state,
                 "mode": "apply" if commit else "dry-run",
             }
         )
@@ -917,17 +934,6 @@ class SyncNetBoxVMsToOpenStack(Script):
     def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         if not change_rows:
-            self.log_info(
-                f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} (0 changes)",
-                obj=nb_vm,
-            )
-            lines = [
-                "| Type | Field | OpenStack | NetBox | Diff | Mode | Details |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
-                "| summary | none | matched | matched | no changes | "
-                f"{'apply' if commit else 'dry-run'} | All evaluated fields already matched |",
-            ]
-            self.log_info("\n".join(lines), obj=nb_vm)
             return
 
         change_order = {
@@ -936,15 +942,22 @@ class SyncNetBoxVMsToOpenStack(Script):
             "rename": 2,
             "metadata": 3,
             "power": 4,
+            "match": 99,
         }
         ordered_rows = sorted(
             enumerate(change_rows),
             key=lambda item: (change_order.get(item[1]["change_type"], 99), item[0]),
         )
 
+        actual_change_count = sum(1 for row in change_rows if row.get("state", "changed") != "matched")
+        comparison_count = len(change_rows)
+        if actual_change_count == 0:
+            summary_suffix = f"(0 changes, {comparison_count} field comparison{'s' if comparison_count != 1 else ''})"
+        else:
+            summary_suffix = f"({actual_change_count} change{'s' if actual_change_count != 1 else ''})"
+
         self.log_info(
-            f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} "
-            f"({len(change_rows)} change{'s' if len(change_rows) != 1 else ''})",
+            f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} {summary_suffix}",
             obj=nb_vm,
         )
 
