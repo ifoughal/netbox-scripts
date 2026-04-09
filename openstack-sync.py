@@ -22,6 +22,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 "VPN tunnel",
                 (
                     "vpn_profile",
+                    "vpn_debug",
                 ),
             ),
             (
@@ -88,6 +89,11 @@ class SyncNetBoxVMsToOpenStack(Script):
         required=False,
         description="Optional OpenVPN profile (.ovpn) to bring up before syncing; the upload is only kept for this job",
     )
+    vpn_debug = BooleanVar(
+        required=False,
+        default=False,
+        description="Log OpenVPN startup output while the tunnel is being established",
+    )
 
     cluster = ObjectVar(
         model=Cluster,
@@ -148,7 +154,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         except ImportError as exc:
             raise AbortScript("openstacksdk is not installed in the NetBox Python environment") from exc
 
-        with self._openvpn_tunnel(data.get("vpn_profile")):
+        with self._openvpn_tunnel(data.get("vpn_profile"), debug=bool(data.get("vpn_debug"))):
             cluster = data["cluster"]
             tenant = data.get("tenant")
             name_prefix = (data.get("name_prefix") or "").strip()
@@ -200,7 +206,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             )
 
     @contextmanager
-    def _openvpn_tunnel(self, uploaded_profile):
+    def _openvpn_tunnel(self, uploaded_profile, debug=False):
         if uploaded_profile is None:
             yield None
             return
@@ -208,12 +214,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         with tempfile.TemporaryDirectory(prefix="netbox-openvpn-") as temp_dir:
             profile_path = Path(temp_dir) / "uploaded-profile.ovpn"
             self._write_uploaded_profile(uploaded_profile, profile_path)
-
-            # self.log_info("sleeping for 5 minutes to allow for any transient OpenVPN connectivity issues to resolve before syncing")
-            # time.sleep(300)
-
-            self.log_info(f"Starting OpenVPN tunnel from uploaded profile {getattr(uploaded_profile, 'name', profile_path.name)}")
-            proc = self._start_openvpn(profile_path)
+            proc = self._start_openvpn(profile_path, debug=debug)
             try:
                 yield proc
             finally:
@@ -245,7 +246,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             timeout = 90
         return max(timeout, 1)
 
-    def _start_openvpn(self, profile_path):
+    def _start_openvpn(self, profile_path, debug=False):
         command = [
             self._openvpn_binary(),
             "--config",
@@ -291,10 +292,12 @@ class SyncNetBoxVMsToOpenStack(Script):
                 if line:
                     line = line.rstrip()
                     output.append(line)
-                    self.log_info(f"[openvpn] {line}")
+                    if debug:
+                        self.log_info(f"[openvpn] {line}")
 
                     if "Initialization Sequence Completed" in line:
-                        self.log_success("OpenVPN tunnel established")
+                        if debug:
+                            self.log_success("OpenVPN tunnel established")
                         return proc
 
                     if "AUTH_FAILED" in line or "Exiting due to fatal error" in line:
