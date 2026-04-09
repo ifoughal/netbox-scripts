@@ -598,7 +598,6 @@ class OpenStackInstance:
 
         drift_found = False
         for group_name, field_specs in FIELD_GROUPS.items():
-            change_type = group_name
             mode = "sync" if group_name == "to_sync" else "report"
 
             for spec in field_specs:
@@ -616,6 +615,7 @@ class OpenStackInstance:
                 compare_kind = spec.get("compare_kind")
                 current_normalized = self._normalize_compare_value(field_name, current_value, compare_kind)
                 desired_normalized = self._normalize_compare_value(field_name, desired_value, compare_kind)
+                change_type = group_name if current_normalized != desired_normalized else "match"
 
                 if current_normalized == desired_normalized:
                     if record_change is not None and nb_vm is not None:
