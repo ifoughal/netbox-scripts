@@ -153,6 +153,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             tenant = data.get("tenant")
             name_prefix = (data.get("name_prefix") or "").strip()
 
+
+            time.sleep(300)
             queryset = VirtualMachine.objects.filter(cluster=cluster)
             if tenant is not None:
                 queryset = queryset.filter(tenant=tenant)
