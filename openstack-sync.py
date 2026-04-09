@@ -39,7 +39,6 @@ METADATA_FIELDS_TO_SYNC = (
     ("netbox_vm_name", "attr", "name", False),
     ("netbox_cluster", "attr", "cluster.name", True),
     ("netbox_status", "attr", "status.value", False),
-    ("netbox_tenant", "attr", "tenant.name", False),
     ("netbox_role", "attr", "role.name", False),
     ("kubespray_groups", "cf", "kubespray_groups", False),
     ("ssh_user", "cf", "ssh_user", False),
@@ -51,6 +50,12 @@ METADATA_FIELDS_TO_SYNC = (
 # `report_only` values are checked for drift but are not written back.
 FIELD_GROUPS = {
     "report_only": (
+        {
+            "field": "netbox_tenant",
+            "openstack_path": "project_name",
+            "source_kind": "attr",
+            "source_name": "tenant.name",
+        },
         {
             "field": "netbox_vcpus",
             "openstack_path": "flavor.vcpus",
