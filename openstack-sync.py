@@ -1021,6 +1021,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             updated_count = 0
             unchanged_count = 0
             failed_count = 0
+            summary_blocks = []
 
             # Each VM gets reconciled independently so a failure does not stop the batch.
             for nb_vm in nb_vms:
@@ -1036,6 +1037,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                         data=data,
                         commit=commit,
                         sync_debug=sync_debug,
+                        summary_blocks=summary_blocks,
                     )
                     if result == "created":
                         created_count += 1
@@ -1046,6 +1048,9 @@ class SyncNetBoxVMsToOpenStack(Script):
                 except Exception as exc:
                     failed_count += 1
                     self.log_failure(f"Failed to sync NetBox VM {nb_vm.name}: {exc}", nb_vm)
+
+            if sync_debug and summary_blocks:
+                self._log_aggregate_change_summary(summary_blocks)
 
             return (
                 f"NetBox to OpenStack sync complete: "
@@ -1257,8 +1262,10 @@ class SyncNetBoxVMsToOpenStack(Script):
             return "DRY-RUN"
         return "INFO"
 
-    def _log_change_summary(self, nb_vm, os_server, change_rows, commit):
+    def _log_change_summary(self, nb_vm, os_server, change_rows, commit, sync_debug=False, summary_blocks=None):
         """Render the accumulated comparison rows as a Markdown summary block."""
+        if not sync_debug:
+            return
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         if not change_rows:
             return
@@ -1318,11 +1325,6 @@ class SyncNetBoxVMsToOpenStack(Script):
                 summary_suffix += f", {report_only_suffix}"
             summary_suffix += ")"
 
-        self.log_debug(
-            f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} {summary_suffix}",
-            obj=nb_vm,
-        )
-
         headers = [
             "Type",
             "Field",
@@ -1349,7 +1351,24 @@ class SyncNetBoxVMsToOpenStack(Script):
             ]
             lines.append("| " + " | ".join(self._markdown_cell(cell) for cell in line) + " |")
 
-        self.log_debug("\n".join(lines), obj=nb_vm)
+        section = "\n".join([
+            f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} {summary_suffix}",
+            "\n".join(lines),
+        ])
+        if summary_blocks is not None:
+            summary_blocks.append(section)
+            return
+
+        self.log_debug(section, obj=nb_vm)
+
+    def _log_aggregate_change_summary(self, summary_blocks):
+        """Render all per-VM markdown summaries as one debug-only block."""
+        if not summary_blocks:
+            return
+
+        self.log_debug(
+            f"### Aggregate change summary ({len(summary_blocks)} VMs)\n\n" + "\n\n---\n\n".join(summary_blocks),
+        )
 
     def _log_change_report(self, nb_vm, os_server, change_rows, commit):
         """Render change rows as a severity-colored NetBox report."""
@@ -1434,7 +1453,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             message = f"**{label}** `{row['field']}`: {comparison_text}{detail_text}"
             self._comparison_row_log_method(row)(message, obj=nb_vm)
 
-    def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False):
+    def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False, summary_blocks=None):
         """Reconcile one NetBox VM against its matching OpenStack server."""
         change_rows = []
         os_instance = OpenStackInstance.retrieve(conn, nb_vm, log_debug=self.log_debug)
@@ -1478,7 +1497,14 @@ class SyncNetBoxVMsToOpenStack(Script):
                     details=f"image={image.name}, flavor={flavor.name}, network={network.name}",
                 )
                 self._log_change_report(nb_vm, None, change_rows, commit)
-                self._log_change_summary(nb_vm, None, change_rows, commit)
+                self._log_change_summary(
+                    nb_vm,
+                    None,
+                    change_rows,
+                    commit,
+                    sync_debug=sync_debug,
+                    summary_blocks=summary_blocks,
+                )
                 return "created"
 
             # In apply mode we create the instance after resolving its resources.
@@ -1548,7 +1574,14 @@ class SyncNetBoxVMsToOpenStack(Script):
                 log_debug=self.log_debug,
             )
             self._log_change_report(nb_vm, os_instance, change_rows, commit)
-            self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+            self._log_change_summary(
+                nb_vm,
+                os_instance,
+                change_rows,
+                commit,
+                sync_debug=sync_debug,
+                summary_blocks=summary_blocks,
+            )
             return "created"
 
         os_server_ref = os_instance.ref()
@@ -1629,7 +1662,14 @@ class SyncNetBoxVMsToOpenStack(Script):
         )
 
         self._log_change_report(nb_vm, os_instance, change_rows, commit)
-        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+        self._log_change_summary(
+            nb_vm,
+            os_instance,
+            change_rows,
+            commit,
+            sync_debug=sync_debug,
+            summary_blocks=summary_blocks,
+        )
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
