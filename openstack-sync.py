@@ -831,8 +831,8 @@ class SyncNetBoxVMsToOpenStack(Script):
 
             if current_normalized == desired_normalized:
                 if sync_debug:
-                    self.log_info(
-                        f"[debug] Metadata {key} already matches on {self._os_server_ref(os_server)} "
+                    self.log_debug(
+                        f"Metadata {key} already matches on {self._os_server_ref(os_server)} "
                         f"for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
                     )
