@@ -591,10 +591,11 @@ class OpenStackInstance:
             return ",".join(cls._security_group_names(value))
         return cls._metadata_scalar(value)
 
-    def compare_field_groups(self, nb_vm, commit, change_rows=None, record_change=None, sync_debug=False, log_debug=None):
+    def compare_field_groups(self, nb_vm, commit, change_rows=None, record_change=None):
         """Compare sync-tracked and report-only OpenStack fields against NetBox."""
         if change_rows is None:
             change_rows = []
+        log_debug = self.log_debug
 
         drift_found = False
         for group_name, field_specs in FIELD_GROUPS.items():
@@ -633,7 +634,7 @@ class OpenStackInstance:
                             mode="match",
                             comparison_group=group_name,
                         )
-                    if sync_debug and log_debug is not None and nb_vm is not None:
+                    if nb_vm is not None:
                         log_debug(
                             f"OpenStack field {field_name} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                             obj=nb_vm,
@@ -655,7 +656,7 @@ class OpenStackInstance:
                         mode=mode,
                         comparison_group=group_name,
                     )
-                if sync_debug and log_debug is not None and nb_vm is not None:
+                if nb_vm is not None:
                     log_debug(
                         f"OpenStack field {field_name} differs on {self.ref()} for {self._nb_vm_ref(nb_vm)}: "
                         f"{current_normalized!r} != {desired_normalized!r}",
@@ -702,14 +703,15 @@ class OpenStackInstance:
 
         return True
 
-    def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None, sync_debug=False, log_debug=None):
+    def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None):
         """Compare, report, and optionally merge the NetBox metadata payload."""
         if change_rows is None:
             change_rows = []
         current_metadata = dict(self.metadata)
         summary_skip_keys = METADATA_SUMMARY_SKIP_KEYS
+        log_debug = self.log_debug
 
-        if sync_debug and log_debug is not None and nb_vm is not None:
+        if nb_vm is not None:
             # Dump the raw metadata and normalized snapshot together when
             # debugging so a mismatch can be traced quickly.
             log_debug(
@@ -741,7 +743,7 @@ class OpenStackInstance:
                         details="matched",
                         state="matched",
                     )
-                if key not in summary_skip_keys and sync_debug and log_debug is not None and nb_vm is not None:
+                if key not in summary_skip_keys and nb_vm is not None:
                     log_debug(
                         f"Metadata {key} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
@@ -885,7 +887,6 @@ class SyncNetBoxVMsToOpenStack(Script):
                 (
                     "allow_rename",
                     "update_metadata",
-                    "sync_debug",
                     "sync_power_state",
                 ),
             ),
@@ -955,11 +956,6 @@ class SyncNetBoxVMsToOpenStack(Script):
         default=True,
         description="Update OpenStack metadata from NetBox VM fields",
     )
-    sync_debug = BooleanVar(
-        required=False,
-        default=False,
-        description="Log unchanged metadata comparisons as debug output",
-    )
     sync_power_state = BooleanVar(
         required=False,
         default=False,
@@ -998,7 +994,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             raise AbortScript("openstacksdk is not installed in the NetBox Python environment") from exc
 
         with self._openvpn_tunnel(data.get("vpn_profile"), debug=bool(data.get("vpn_debug"))):
-            sync_debug = bool(data.get("sync_debug"))
             # Build the NetBox queryset from the selected scope before iterating.
             cluster = data["cluster"]
             tenant = data.get("tenant")
@@ -1036,7 +1031,6 @@ class SyncNetBoxVMsToOpenStack(Script):
                         nb_vm=nb_vm,
                         data=data,
                         commit=commit,
-                        sync_debug=sync_debug,
                         summary_blocks=summary_blocks,
                     )
                     if result == "created":
@@ -1049,7 +1043,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                     failed_count += 1
                     self.log_failure(f"Failed to sync NetBox VM {nb_vm.name}: {exc}", nb_vm)
 
-            if sync_debug and summary_blocks:
+            if summary_blocks:
                 self._log_aggregate_change_summary(summary_blocks)
 
             return (
@@ -1262,10 +1256,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             return "DRY-RUN"
         return "INFO"
 
-    def _log_change_summary(self, nb_vm, os_server, change_rows, commit, sync_debug=False, summary_blocks=None):
+    def _log_change_summary(self, nb_vm, os_server, change_rows, summary_blocks=None):
         """Render the accumulated comparison rows as a Markdown summary block."""
-        if not sync_debug:
-            return
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
         if not change_rows:
             return
@@ -1453,7 +1445,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             message = f"**{label}** `{row['field']}`: {comparison_text}{detail_text}"
             self._comparison_row_log_method(row)(message, obj=nb_vm)
 
-    def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False, summary_blocks=None):
+    def _sync_vm(self, conn, nb_vm, data, commit, summary_blocks=None):
         """Reconcile one NetBox VM against its matching OpenStack server."""
         change_rows = []
         os_instance = OpenStackInstance.retrieve(conn, nb_vm, log_debug=self.log_debug)
@@ -1501,8 +1493,6 @@ class SyncNetBoxVMsToOpenStack(Script):
                     nb_vm,
                     None,
                     change_rows,
-                    commit,
-                    sync_debug=sync_debug,
                     summary_blocks=summary_blocks,
                 )
                 return "created"
@@ -1552,8 +1542,6 @@ class SyncNetBoxVMsToOpenStack(Script):
                     change_rows=change_rows,
                     record_change=self._record_change,
                     nb_vm=nb_vm,
-                    sync_debug=sync_debug,
-                    log_debug=self.log_debug,
                 )
             if data.get("sync_power_state"):
                 os_instance.sync_power_state(
@@ -1570,16 +1558,12 @@ class SyncNetBoxVMsToOpenStack(Script):
                 commit=commit,
                 change_rows=change_rows,
                 record_change=self._record_change,
-                sync_debug=sync_debug,
-                log_debug=self.log_debug,
             )
             self._log_change_report(nb_vm, os_instance, change_rows, commit)
             self._log_change_summary(
                 nb_vm,
                 os_instance,
                 change_rows,
-                commit,
-                sync_debug=sync_debug,
                 summary_blocks=summary_blocks,
             )
             return "created"
@@ -1636,8 +1620,6 @@ class SyncNetBoxVMsToOpenStack(Script):
                 change_rows=change_rows,
                 record_change=self._record_change,
                 nb_vm=nb_vm,
-                sync_debug=sync_debug,
-                log_debug=self.log_debug,
             ) or changed
 
         if data.get("sync_power_state"):
@@ -1657,8 +1639,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             commit=commit,
             change_rows=change_rows,
             record_change=self._record_change,
-            sync_debug=sync_debug,
-            log_debug=self.log_debug,
         )
 
         self._log_change_report(nb_vm, os_instance, change_rows, commit)
@@ -1666,8 +1646,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             nb_vm,
             os_instance,
             change_rows,
-            commit,
-            sync_debug=sync_debug,
             summary_blocks=summary_blocks,
         )
 
