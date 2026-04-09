@@ -148,13 +148,15 @@ class SyncNetBoxVMsToOpenStack(Script):
         except ImportError as exc:
             raise AbortScript("openstacksdk is not installed in the NetBox Python environment") from exc
 
+        self.log_info("sleeping for 5 minutes to allow for any transient OpenVPN connectivity issues to resolve before syncing")
+        time.sleep(300)
+
         with self._openvpn_tunnel(data.get("vpn_profile")):
             cluster = data["cluster"]
             tenant = data.get("tenant")
             name_prefix = (data.get("name_prefix") or "").strip()
 
 
-            time.sleep(300)
             queryset = VirtualMachine.objects.filter(cluster=cluster)
             if tenant is not None:
                 queryset = queryset.filter(tenant=tenant)
