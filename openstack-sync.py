@@ -22,6 +22,43 @@ from utilities.exceptions import AbortScript
 from virtualization.models import Cluster, VirtualMachine
 
 
+# Metadata fields that are mirrored into OpenStack but omitted from the summary
+# because they are derived bookkeeping values rather than reconciliation signals.
+METADATA_SUMMARY_SKIP_KEYS = frozenset({
+    "netbox_vm_id",
+    "netbox_vm_name",
+    "netbox_status",
+})
+
+# NetBox-to-OpenStack metadata fields that the script builds, compares, and
+# conditionally pushes into the OpenStack server metadata. The final boolean in
+# each entry controls whether an empty value should be written explicitly.
+METADATA_FIELDS_TO_SYNC = (
+    ("netbox_vm_id", "attr", "pk", False),
+    ("netbox_vm_name", "attr", "name", False),
+    ("netbox_cluster", "attr", "cluster.name", True),
+    ("netbox_status", "attr", "status.value", False),
+    ("netbox_tenant", "attr", "tenant.name", False),
+    ("netbox_role", "attr", "role.name", False),
+    ("netbox_vcpus", "attr", "vcpus", False),
+    ("netbox_memory_mb", "attr", "memory", False),
+    ("netbox_disk_mb", "attr", "disk", False),
+    ("kubespray_groups", "cf", "kubespray_groups", False),
+    ("ssh_user", "cf", "ssh_user", False),
+    ("use_access_ip", "cf", "user_access_ip", False),
+)
+
+# OpenStack-side fields that are compared against NetBox values but are not
+# automatically mutated by this script. This keeps the summary useful for drift
+# detection without implying that every OpenStack attribute is writable.
+OPENSTACK_COMPARE_ONLY_FIELDS = (
+    ("flavor", "flavor.name", "cf", "openstack_flavor"),
+    ("availability_zone", "availability_zone", "cf_first", ("openstack_availability_zone", "openstack_location_zone")),
+    ("key_name", "key_name", "cf", "key_name"),
+    ("security_groups", "security_groups", "cf_list", "openstack_security_groups"),
+)
+
+
 class OpenStackInstance:
     """Normalized view of an OpenStack server used by the sync workflow."""
 
@@ -242,35 +279,12 @@ class OpenStackInstance:
     @classmethod
     def desired_metadata(cls, nb_vm):
         """Build the OpenStack metadata payload that should mirror the NetBox VM."""
-        metadata = {
-            "netbox_vm_id": str(nb_vm.pk),
-            "netbox_vm_name": nb_vm.name,
-            "netbox_cluster": nb_vm.cluster.name if nb_vm.cluster else "",
-            "netbox_status": str(getattr(nb_vm.status, "value", nb_vm.status)),
-        }
-
-        if nb_vm.tenant:
-            metadata["netbox_tenant"] = nb_vm.tenant.name
-        if nb_vm.role:
-            metadata["netbox_role"] = nb_vm.role.name
-        if nb_vm.vcpus is not None:
-            metadata["netbox_vcpus"] = str(nb_vm.vcpus)
-        if nb_vm.memory is not None:
-            metadata["netbox_memory_mb"] = str(nb_vm.memory)
-        if nb_vm.disk is not None:
-            metadata["netbox_disk_mb"] = str(nb_vm.disk)
-
-        kubespray_groups = cls._normalize_metadata_value("kubespray_groups", cls._vm_cf_value(nb_vm, "kubespray_groups"))
-        if kubespray_groups:
-            metadata["kubespray_groups"] = kubespray_groups
-
-        ssh_user = cls._metadata_scalar(cls._vm_cf_value(nb_vm, "ssh_user"))
-        if ssh_user:
-            metadata["ssh_user"] = ssh_user
-
-        use_access_ip = cls._metadata_scalar(cls._vm_cf_value(nb_vm, "user_access_ip"))
-        if use_access_ip:
-            metadata["use_access_ip"] = use_access_ip
+        metadata = {}
+        for key, source_kind, source_name, keep_empty in METADATA_FIELDS_TO_SYNC:
+            value = cls._resolve_netbox_source_value(nb_vm, key, source_kind, source_name, keep_empty=keep_empty)
+            if value is None:
+                continue
+            metadata[key] = value
 
         return metadata
 
@@ -446,12 +460,115 @@ class OpenStackInstance:
 
         return cls._metadata_scalar(value)
 
-    @staticmethod
-    def _metadata_summary_skip_keys():
-        """Return metadata keys that are synced but hidden from comparison rows."""
-        # These values are already represented by dedicated sync paths, so
-        # logging them again only adds noise to the job summary.
-        return {"netbox_vm_id", "netbox_vm_name", "netbox_status"}
+    @classmethod
+    def _resolve_netbox_source_value(cls, nb_vm, source_key, source_kind, source_name, keep_empty=False):
+        """Resolve a desired NetBox value from the configured sync spec."""
+        if source_kind == "attr":
+            value = cls._get_attr(nb_vm, source_name)
+            if value in (None, "", []):
+                if keep_empty:
+                    return ""
+                return None
+            return cls._metadata_scalar(value)
+
+        if source_kind == "cf_first":
+            candidate_names = source_name if isinstance(source_name, (list, tuple, set)) else [source_name]
+            for candidate in candidate_names:
+                value = cls._vm_cf_value(nb_vm, candidate)
+                if value not in (None, "", []):
+                    return cls._metadata_scalar(value)
+            if keep_empty:
+                return ""
+            return None
+
+        if source_kind == "cf_list":
+            value = cls._vm_cf_data(nb_vm).get(source_name)
+            if value in (None, ""):
+                if keep_empty:
+                    return []
+                return None
+            if isinstance(value, list):
+                return [item for item in value if item not in (None, "")]
+            return [value]
+
+        if source_kind == "cf":
+            value = cls._vm_cf_value(nb_vm, source_name)
+            if value in (None, "", []):
+                if keep_empty:
+                    return ""
+                return None
+            if source_key == "kubespray_groups":
+                return cls._normalize_metadata_value(source_key, value)
+            return cls._metadata_scalar(value)
+
+        raise ValueError(f"Unsupported metadata source kind: {source_kind}")
+
+    @classmethod
+    def _normalize_compare_value(cls, field_name, value):
+        """Normalize compare-only field values so OpenStack and NetBox align."""
+        if field_name == "security_groups":
+            return ",".join(cls._security_group_names(value))
+        return cls._metadata_scalar(value)
+
+    def compare_report_only_fields(self, nb_vm, commit, change_rows=None, record_change=None, sync_debug=False, log_debug=None):
+        """Compare OpenStack-only attributes against NetBox and log any drift."""
+        if change_rows is None:
+            change_rows = []
+
+        drift_found = False
+        for field_name, openstack_path, source_kind, source_name in OPENSTACK_COMPARE_ONLY_FIELDS:
+            desired_value = self._resolve_netbox_source_value(nb_vm, field_name, source_kind, source_name)
+            if desired_value in (None, "", []):
+                continue
+
+            current_value = self._get_attr(self.__dict__, openstack_path)
+            current_normalized = self._normalize_compare_value(field_name, current_value)
+            desired_normalized = self._normalize_compare_value(field_name, desired_value)
+
+            if current_normalized == desired_normalized:
+                if record_change is not None and nb_vm is not None:
+                    record_change(
+                        change_rows,
+                        nb_vm,
+                        self,
+                        "compare",
+                        field_name,
+                        current_normalized,
+                        desired_normalized,
+                        commit,
+                        details="report_only",
+                        state="matched",
+                        mode="report",
+                    )
+                if sync_debug and log_debug is not None and nb_vm is not None:
+                    log_debug(
+                        f"OpenStack field {field_name} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
+                        obj=nb_vm,
+                    )
+                continue
+
+            drift_found = True
+            if record_change is not None and nb_vm is not None:
+                record_change(
+                    change_rows,
+                    nb_vm,
+                    self,
+                    "compare",
+                    field_name,
+                    current_normalized,
+                    desired_normalized,
+                    commit,
+                    details="report_only",
+                    mode="report",
+                )
+            if sync_debug and log_debug is not None and nb_vm is not None:
+                log_debug(
+                    f"OpenStack field {field_name} differs on {self.ref()} for {self._nb_vm_ref(nb_vm)}: "
+                    f"{current_normalized!r} != {desired_normalized!r}",
+                    obj=nb_vm,
+                )
+
+        return drift_found
 
     def update_name(self, desired_name, commit, change_rows=None, record_change=None, nb_vm=None):
         """Rename the OpenStack server when the NetBox VM name differs."""
@@ -496,7 +613,7 @@ class OpenStackInstance:
         if change_rows is None:
             change_rows = []
         current_metadata = dict(self.metadata)
-        summary_skip_keys = self._metadata_summary_skip_keys()
+        summary_skip_keys = METADATA_SUMMARY_SKIP_KEYS
 
         if sync_debug and log_debug is not None and nb_vm is not None:
             # Dump the raw metadata and normalized snapshot together when
@@ -996,7 +1113,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         """Escape a summary value so it remains valid inside a Markdown table."""
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
-    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details="", state="changed"):
+    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details="", state="changed", mode=None):
         """Append a single comparison row to the summary accumulator."""
         openstack_text = self._summary_value(openstack_value)
         netbox_text = self._summary_value(netbox_value)
@@ -1013,7 +1130,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 "diff": f"{openstack_text} -> {netbox_text}",
                 "details": details,
                 "state": state,
-                "mode": "apply" if commit else "dry-run",
+                "mode": mode or ("apply" if commit else "dry-run"),
             }
         )
 
@@ -1030,6 +1147,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             "rename": 2,
             "metadata": 3,
             "power": 4,
+            "compare": 5,
             "match": 99,
         }
         ordered_rows = sorted(
@@ -1037,17 +1155,34 @@ class SyncNetBoxVMsToOpenStack(Script):
             key=lambda item: (change_order.get(item[1]["change_type"], 99), item[0]),
         )
 
-        actual_change_count = sum(1 for row in change_rows if row.get("state", "changed") != "matched")
+        applied_change_count = sum(
+            1
+            for row in change_rows
+            if row.get("mode") != "report" and row.get("state", "changed") != "matched"
+        )
+        report_only_count = sum(1 for row in change_rows if row.get("mode") == "report")
         comparison_count = len(change_rows)
         # Count every comparison row, even matched ones, so the summary proves
-        # which fields were checked and which ones actually changed.
-        if actual_change_count == 0:
-            summary_suffix = f"(0 changes, {comparison_count} field comparison{'s' if comparison_count != 1 else ''})"
+        # which fields were checked and which ones were only reported.
+        comparison_suffix = f"{comparison_count} field comparison{'s' if comparison_count != 1 else ''}"
+        report_only_suffix = (
+            f"{report_only_count} report-only comparison{'s' if report_only_count != 1 else ''}"
+            if report_only_count
+            else ""
+        )
+        if applied_change_count == 0:
+            summary_suffix = f"(0 applied changes, {comparison_suffix}"
+            if report_only_suffix:
+                summary_suffix += f", {report_only_suffix}"
+            summary_suffix += ")"
         else:
             summary_suffix = (
-                f"({actual_change_count} change{'s' if actual_change_count != 1 else ''}, "
-                f"{comparison_count} field comparison{'s' if comparison_count != 1 else ''})"
+                f"({applied_change_count} applied change{'s' if applied_change_count != 1 else ''}, "
+                f"{comparison_suffix}"
             )
+            if report_only_suffix:
+                summary_suffix += f", {report_only_suffix}"
+            summary_suffix += ")"
 
         self.log_info(
             f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} {summary_suffix}",
@@ -1184,6 +1319,16 @@ class SyncNetBoxVMsToOpenStack(Script):
                     record_change=self._record_change,
                     nb_vm=nb_vm,
                 )
+            # Compare-only fields are surfaced in the summary but are not
+            # automatically mutated by this script.
+            os_instance.compare_report_only_fields(
+                nb_vm=nb_vm,
+                commit=commit,
+                change_rows=change_rows,
+                record_change=self._record_change,
+                sync_debug=sync_debug,
+                log_debug=self.log_debug,
+            )
             self._log_change_summary(nb_vm, os_instance, change_rows, commit)
             return "created"
 
@@ -1253,13 +1398,18 @@ class SyncNetBoxVMsToOpenStack(Script):
                 nb_vm=nb_vm,
             ) or changed
 
-        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
+        # Compare-only fields are surfaced in the summary but are not
+        # automatically mutated by this script.
+        changed = os_instance.compare_report_only_fields(
+            nb_vm=nb_vm,
+            commit=commit,
+            change_rows=change_rows,
+            record_change=self._record_change,
+            sync_debug=sync_debug,
+            log_debug=self.log_debug,
+        ) or changed
 
-        if changed and not change_rows:
-            self.log_info(
-                f"Updated derived metadata fields for {nb_vm_ref} against {os_server_ref}",
-                obj=nb_vm,
-            )
+        self._log_change_summary(nb_vm, os_instance, change_rows, commit)
 
         if not changed:
             self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
