@@ -1,3 +1,4 @@
+import html
 from contextlib import contextmanager
 import os
 import select
@@ -353,7 +354,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         return str(value)
 
     def _markdown_cell(self, value):
-        return self._summary_value(value).replace("|", "\\|").replace("\n", " ")
+        return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
     def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details=""):
         openstack_text = self._summary_value(openstack_value)
