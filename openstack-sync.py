@@ -345,11 +345,12 @@ class SyncNetBoxVMsToOpenStack(Script):
         desired_name = nb_vm.name
 
         if os_server is None:
-            self.log_info(f"No matching OpenStack server found for {nb_vm_ref}")
+            self.log_info(f"No matching OpenStack server found for {nb_vm_ref}", obj=nb_vm)
             if not data.get("allow_create"):
                 self.log_warning(
                     f"No matching OpenStack server found for {nb_vm_ref}. "
-                    f"Creation is disabled."
+                    f"Creation is disabled.",
+                    obj=nb_vm,
                 )
                 return "unchanged"
 
@@ -363,9 +364,9 @@ class SyncNetBoxVMsToOpenStack(Script):
             )
 
             if commit:
-                self.log_info(create_message)
+                self.log_info(create_message, obj=nb_vm)
             else:
-                self.log_info(f"[dry-run] {create_message}")
+                self.log_info(f"[dry-run] {create_message}", obj=nb_vm)
                 return "created"
 
             os_server = self._create_server(conn, nb_vm, data, image, flavor, network)
@@ -382,7 +383,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             if commit:
                 self.log_info(
                     f"Updating openstack_id on {nb_vm_ref} from {openstack_id or '<empty>'} "
-                    f"to {os_server.id} to match {os_server_ref}"
+                    f"to {os_server.id} to match {os_server_ref}",
+                    obj=nb_vm,
                 )
                 self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
                 self.log_success(
@@ -392,18 +394,19 @@ class SyncNetBoxVMsToOpenStack(Script):
             else:
                 self.log_info(
                     f"[dry-run] Would update openstack_id on {nb_vm_ref} from {openstack_id or '<empty>'} "
-                    f"to {os_server.id} to match {os_server_ref}"
+                    f"to {os_server.id} to match {os_server_ref}",
+                    obj=nb_vm,
                 )
 
         if data.get("allow_rename") and (os_server.name or "") != desired_name:
             changed = True
             if commit:
-                self.log_info(f"Renaming {os_server_ref} to {desired_name} for {nb_vm_ref}")
+                self.log_info(f"Renaming {os_server_ref} to {desired_name} for {nb_vm_ref}", obj=nb_vm)
                 os_server = conn.compute.update_server(os_server, name=desired_name)
                 os_server_ref = self._os_server_ref(os_server)
                 self.log_success(f"Renamed {os_server_ref} to match {nb_vm_ref}", nb_vm)
             else:
-                self.log_info(f"[dry-run] Would rename {os_server_ref} to {desired_name} for {nb_vm_ref}")
+                self.log_info(f"[dry-run] Would rename {os_server_ref} to {desired_name} for {nb_vm_ref}", obj=nb_vm)
 
         if data.get("update_metadata"):
             changed = self._sync_metadata(conn, os_server, nb_vm, commit) or changed
@@ -412,7 +415,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             changed = self._sync_power_state(conn, os_server, nb_vm, commit) or changed
 
         if not changed:
-            self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}")
+            self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}", obj=nb_vm)
             return "unchanged"
 
         return "updated"
@@ -647,12 +650,14 @@ class SyncNetBoxVMsToOpenStack(Script):
                 if commit:
                     self.log_info(
                         f"Updating metadata {key} on {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}: "
-                        f"{current_value!r} -> {value!r}"
+                        f"{current_value!r} -> {value!r}",
+                        obj=nb_vm,
                     )
                 else:
                     self.log_info(
                         f"[dry-run] Would update metadata {key} on {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}: "
-                        f"{current_value!r} -> {value!r}"
+                        f"{current_value!r} -> {value!r}",
+                        obj=nb_vm,
                     )
 
         if not pending:
@@ -706,7 +711,8 @@ class SyncNetBoxVMsToOpenStack(Script):
         if desired == "ACTIVE" and actual == "SHUTOFF":
             if commit:
                 self.log_info(
-                    f"Starting {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                    f"Starting {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
+                    obj=nb_vm,
                 )
                 conn.compute.start_server(os_server)
                 self.log_success(
@@ -715,14 +721,16 @@ class SyncNetBoxVMsToOpenStack(Script):
                 )
             else:
                 self.log_info(
-                    f"[dry-run] Would start {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                    f"[dry-run] Would start {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
+                    obj=nb_vm,
                 )
             return True
 
         if desired == "SHUTOFF" and actual == "ACTIVE":
             if commit:
                 self.log_info(
-                    f"Stopping {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                    f"Stopping {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
+                    obj=nb_vm,
                 )
                 conn.compute.stop_server(os_server)
                 self.log_success(
@@ -731,7 +739,8 @@ class SyncNetBoxVMsToOpenStack(Script):
                 )
             else:
                 self.log_info(
-                    f"[dry-run] Would stop {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                    f"[dry-run] Would stop {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}",
+                    obj=nb_vm,
                 )
             return True
 
