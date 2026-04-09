@@ -354,6 +354,20 @@ class SyncNetBoxVMsToOpenStack(Script):
             return "<empty>"
         return str(value)
 
+    def _get_attr(self, obj, *paths):
+        for path in paths:
+            current = obj
+            for part in path.split("."):
+                if current is None:
+                    break
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    current = getattr(current, part, None)
+            if current not in (None, "", []):
+                return current
+        return None
+
     def _metadata_scalar(self, value):
         if value in (None, ""):
             return ""
@@ -374,6 +388,114 @@ class SyncNetBoxVMsToOpenStack(Script):
             return str(getattr(value, "name")).strip()
 
         return str(value).strip()
+
+    def _security_group_names(self, groups):
+        if groups in (None, ""):
+            return ""
+
+        names = []
+        for group in groups if isinstance(groups, (list, tuple, set)) else [groups]:
+            name = self._metadata_scalar(self._get_attr(group, "name") if not isinstance(group, str) else group)
+            if name:
+                names.append(name)
+
+        if not names:
+            return ""
+
+        deduped = []
+        seen = set()
+        for name in names:
+            normalized = name.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(name)
+
+        return ",".join(sorted(deduped, key=str.lower))
+
+    def _desired_k8s_cluster_name(self, nb_vm):
+        key_name = self._metadata_scalar(self._get_vm_cf_value(nb_vm, "key_name"))
+        if key_name.startswith("kubernetes-"):
+            return key_name.removeprefix("kubernetes-") or ""
+
+        raw_cluster = self._get_vm_cf_value(nb_vm, "k8s_cluster")
+        return self._metadata_scalar(raw_cluster)
+
+    def _current_openstack_value(self, os_server, current_metadata, field_name):
+        if field_name in {
+            "netbox_vm_id",
+            "netbox_vm_name",
+            "netbox_cluster",
+            "netbox_status",
+            "netbox_tenant",
+            "netbox_role",
+            "netbox_vcpus",
+            "netbox_memory_mb",
+            "netbox_disk_mb",
+            "ssh_user",
+            "use_access_ip",
+        }:
+            return self._metadata_scalar(current_metadata.get(field_name))
+
+        if field_name == "hostname":
+            return self._metadata_scalar(self._get_attr(os_server, "hostname", "OS-EXT-SRV-ATTR:hostname"))
+
+        if field_name == "kubespray_groups":
+            return self._normalize_metadata_value(field_name, current_metadata.get(field_name))
+
+        if field_name == "openstack_project_id":
+            return self._metadata_scalar(
+                self._get_attr(
+                    os_server,
+                    "project_id",
+                    "tenant_id",
+                    "location.project.id",
+                    "location.project_id",
+                    "project.id",
+                )
+            )
+
+        if field_name == "openstack_project_name":
+            return self._metadata_scalar(
+                self._get_attr(
+                    os_server,
+                    "location.project.name",
+                    "project.name",
+                )
+            )
+
+        if field_name == "openstack_availability_zone":
+            return self._metadata_scalar(self._get_attr(os_server, "availability_zone", "OS-EXT-AZ:availability_zone"))
+
+        if field_name == "openstack_host_id":
+            return self._metadata_scalar(self._get_attr(os_server, "host_id", "hostId"))
+
+        if field_name == "openstack_location_cloud":
+            return self._metadata_scalar(self._get_attr(os_server, "location.cloud"))
+
+        if field_name == "openstack_location_region":
+            return self._metadata_scalar(self._get_attr(os_server, "location.region_name", "location.region"))
+
+        if field_name == "openstack_location_zone":
+            return self._metadata_scalar(self._get_attr(os_server, "location.zone"))
+
+        if field_name == "openstack_flavor":
+            flavor = self._get_attr(os_server, "flavor")
+            return self._metadata_scalar(self._get_attr(flavor, "original_name", "name", "id"))
+
+        if field_name == "openstack_security_groups":
+            return self._security_group_names(self._get_attr(os_server, "security_groups"))
+
+        if field_name == "key_name":
+            return self._metadata_scalar(self._get_attr(os_server, "key_name"))
+
+        if field_name == "k8s_cluster":
+            key_name = self._metadata_scalar(self._get_attr(os_server, "key_name"))
+            if key_name.startswith("kubernetes-"):
+                return key_name.removeprefix("kubernetes-") or ""
+            return self._metadata_scalar(current_metadata.get(field_name))
+
+        return self._metadata_scalar(current_metadata.get(field_name))
 
     def _markdown_cell(self, value):
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
@@ -852,6 +974,33 @@ class SyncNetBoxVMsToOpenStack(Script):
                 f"```json\n{current_metadata_dump}\n```",
                 obj=nb_vm,
             )
+            parsed_snapshot_fields = (
+                "hostname",
+                "openstack_project_id",
+                "openstack_project_name",
+                "openstack_availability_zone",
+                "openstack_host_id",
+                "openstack_location_cloud",
+                "openstack_location_region",
+                "openstack_location_zone",
+                "openstack_flavor",
+                "openstack_security_groups",
+                "key_name",
+                "k8s_cluster",
+                "kubespray_groups",
+                "ssh_user",
+                "use_access_ip",
+            )
+            parsed_snapshot = {
+                field_name: self._current_openstack_value(os_server, current_metadata, field_name)
+                for field_name in parsed_snapshot_fields
+            }
+            self.log_debug(
+                f"Parsed OpenStack resource snapshot for {self._os_server_ref(os_server)} "
+                f"and {self._nb_vm_ref(nb_vm)}:\n"
+                f"```json\n{json.dumps(parsed_snapshot, indent=2, sort_keys=True)}\n```",
+                obj=nb_vm,
+            )
 
         pending = {}
         for key, value in desired_metadata.items():
@@ -884,7 +1033,9 @@ class SyncNetBoxVMsToOpenStack(Script):
             return False
 
         if commit:
-            conn.compute.set_server_metadata(os_server, **pending)
+            merged_metadata = dict(current_metadata)
+            merged_metadata.update(pending)
+            conn.compute.set_server_metadata(os_server, **merged_metadata)
         return True
 
     def _normalize_metadata_value(self, field_name, value):
@@ -922,29 +1073,21 @@ class SyncNetBoxVMsToOpenStack(Script):
             metadata["netbox_disk_mb"] = str(nb_vm.disk)
 
         field_map = (
-            ("hostname", ("hostname", "openstack_hostname")),
             ("kubespray_groups", ("kubespray_groups",)),
-            ("openstack_project_id", ("openstack_project_id",)),
-            ("openstack_project_name", ("openstack_project_name",)),
-            ("openstack_availability_zone", ("openstack_availability_zone",)),
-            ("openstack_host_id", ("openstack_host_id",)),
-            ("openstack_location_cloud", ("openstack_location_cloud",)),
-            ("openstack_location_region", ("openstack_location_region",)),
-            ("openstack_location_zone", ("openstack_location_zone",)),
-            ("openstack_flavor", ("openstack_flavor",)),
-            ("openstack_security_groups", ("openstack_security_groups",)),
-            ("key_name", ("key_name",)),
             ("ssh_user", ("ssh_user",)),
             ("use_access_ip", ("user_access_ip",)),
             ("k8s_cluster", ("k8s_cluster",)),
         )
 
         for metadata_key, field_names in field_map:
-            value = None
-            for field_name in field_names:
-                value = self._metadata_scalar(self._get_vm_cf_value(nb_vm, field_name))
-                if value:
-                    break
+            if metadata_key == "k8s_cluster":
+                value = self._desired_k8s_cluster_name(nb_vm)
+            else:
+                value = None
+                for field_name in field_names:
+                    value = self._metadata_scalar(self._get_vm_cf_value(nb_vm, field_name))
+                    if value:
+                        break
             if value:
                 metadata[metadata_key] = value
 
