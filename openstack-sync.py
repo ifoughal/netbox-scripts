@@ -334,6 +334,7 @@ class SyncNetBoxVMsToOpenStack(Script):
     def _sync_vm(self, conn, vm, data, commit):
         server = self._find_server_for_vm(conn, vm)
         self.log_info(f"Syncing NetBox VM {vm.name} to OpenStack instance {getattr(server, 'name', None) or server.id if server else '<none>'}")
+
         desired_name = vm.name
         changes = []
 
