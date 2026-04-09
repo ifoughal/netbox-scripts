@@ -354,6 +354,27 @@ class SyncNetBoxVMsToOpenStack(Script):
             return "<empty>"
         return str(value)
 
+    def _metadata_scalar(self, value):
+        if value in (None, ""):
+            return ""
+
+        if isinstance(value, dict):
+            for key in ("name", "value", "label", "display", "slug", "id"):
+                nested = value.get(key)
+                if nested not in (None, ""):
+                    return str(nested).strip()
+            return json.dumps(value, sort_keys=True)
+
+        if isinstance(value, (list, tuple, set)):
+            parts = [self._metadata_scalar(item) for item in value]
+            parts = [item for item in parts if item]
+            return ",".join(parts)
+
+        if hasattr(value, "name") and getattr(value, "name", None) not in (None, ""):
+            return str(getattr(value, "name")).strip()
+
+        return str(value).strip()
+
     def _markdown_cell(self, value):
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
@@ -735,12 +756,23 @@ class SyncNetBoxVMsToOpenStack(Script):
         openstack_id = self._get_vm_openstack_id(nb_vm)
         if openstack_id:
             os_server = conn.compute.find_server(openstack_id, ignore_missing=True)
+            self.log_debug(
+                f"Looking up OpenStack server by openstack_id={openstack_id!r}"
+                f"for {self._nb_vm_ref(nb_vm)}: "
+                f"{'found ' + self._os_server_ref(os_server) if os_server else 'not found'}",
+                obj=nb_vm
+            )
             if os_server is not None:
                 return os_server
 
         serial = (nb_vm.serial or "").strip()
         if serial:
             os_server = conn.compute.find_server(serial, ignore_missing=True)
+            self.log_debug(
+                f"Looking up OpenStack server by serial={serial!r} for {self._nb_vm_ref(nb_vm)}: "
+                f"{'found ' + self._os_server_ref(os_server) if os_server else 'not found'}",
+                obj=nb_vm
+            )
             if os_server is not None:
                 return os_server
 
@@ -806,6 +838,11 @@ class SyncNetBoxVMsToOpenStack(Script):
 
         desired_metadata = self._desired_metadata(nb_vm)
         current_metadata_resource = conn.compute.get_server_metadata(os_server)
+        self.log_debug(
+            f"Raw metadata resource retrieved for {self._os_server_ref(os_server)} and {self._nb_vm_ref(nb_vm)}: "
+            f"{current_metadata_resource}",
+            obj=nb_vm,
+        )
         current_metadata = getattr(current_metadata_resource, "metadata", {}) or {}
 
         if sync_debug:
@@ -863,11 +900,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             normalized_values = [str(entry).strip() for entry in raw_values if str(entry).strip()]
             return ",".join(normalized_values)
 
-        if isinstance(value, (list, tuple, set)):
-            normalized_values = [str(entry).strip() for entry in value if str(entry).strip()]
-            return ",".join(normalized_values)
-
-        return str(value).strip()
+        return self._metadata_scalar(value)
 
     def _desired_metadata(self, nb_vm):
         metadata = {
@@ -888,17 +921,32 @@ class SyncNetBoxVMsToOpenStack(Script):
         if nb_vm.disk is not None:
             metadata["netbox_disk_mb"] = str(nb_vm.disk)
 
-        for field_name in (
-            "hostname",
-            "kubespray_groups",
-            "openstack_project_id",
-            "openstack_project_name",
-            "openstack_location_region",
-            "openstack_location_zone",
-        ):
-            value = self._get_vm_cf_value(nb_vm, field_name)
+        field_map = (
+            ("hostname", ("hostname", "openstack_hostname")),
+            ("kubespray_groups", ("kubespray_groups",)),
+            ("openstack_project_id", ("openstack_project_id",)),
+            ("openstack_project_name", ("openstack_project_name",)),
+            ("openstack_availability_zone", ("openstack_availability_zone",)),
+            ("openstack_host_id", ("openstack_host_id",)),
+            ("openstack_location_cloud", ("openstack_location_cloud",)),
+            ("openstack_location_region", ("openstack_location_region",)),
+            ("openstack_location_zone", ("openstack_location_zone",)),
+            ("openstack_flavor", ("openstack_flavor",)),
+            ("openstack_security_groups", ("openstack_security_groups",)),
+            ("key_name", ("key_name",)),
+            ("ssh_user", ("ssh_user",)),
+            ("use_access_ip", ("user_access_ip",)),
+            ("k8s_cluster", ("k8s_cluster",)),
+        )
+
+        for metadata_key, field_names in field_map:
+            value = None
+            for field_name in field_names:
+                value = self._metadata_scalar(self._get_vm_cf_value(nb_vm, field_name))
+                if value:
+                    break
             if value:
-                metadata[field_name] = str(value)
+                metadata[metadata_key] = value
 
         return metadata
 
