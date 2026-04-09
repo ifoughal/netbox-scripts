@@ -1,5 +1,13 @@
+from contextlib import contextmanager
+import os
+import select
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
 from django import forms
-from extras.scripts import Script, StringVar, ObjectVar, BooleanVar
+from extras.scripts import Script, StringVar, ObjectVar, BooleanVar, FileVar
 from tenancy.models import Tenant
 from utilities.exceptions import AbortScript
 from virtualization.models import Cluster, VirtualMachine
@@ -10,6 +18,12 @@ class SyncNetBoxVMsToOpenStack(Script):
         name = "Sync NetBox VMs to OpenStack"
         description = "Push NetBox virtual machine data into OpenStack instances. Leave Commit unchecked to run in dry-run mode."
         fieldsets = (
+            (
+                "VPN tunnel",
+                (
+                    "vpn_profile",
+                ),
+            ),
             (
                 "OpenStack authentication",
                 (
@@ -69,6 +83,10 @@ class SyncNetBoxVMsToOpenStack(Script):
         required=False,
         default=True,
         description="Validate the OpenStack API TLS certificate",
+    )
+    vpn_profile = FileVar(
+        required=False,
+        description="Optional OpenVPN profile (.ovpn) to bring up before syncing; the upload is only kept for this job",
     )
 
     cluster = ObjectVar(
@@ -130,54 +148,177 @@ class SyncNetBoxVMsToOpenStack(Script):
         except ImportError as exc:
             raise AbortScript("openstacksdk is not installed in the NetBox Python environment") from exc
 
-        cluster = data["cluster"]
-        tenant = data.get("tenant")
-        name_prefix = (data.get("name_prefix") or "").strip()
+        with self._openvpn_tunnel(data.get("vpn_profile")):
+            cluster = data["cluster"]
+            tenant = data.get("tenant")
+            name_prefix = (data.get("name_prefix") or "").strip()
 
-        queryset = VirtualMachine.objects.filter(cluster=cluster)
-        if tenant is not None:
-            queryset = queryset.filter(tenant=tenant)
-        if name_prefix:
-            queryset = queryset.filter(name__startswith=name_prefix)
+            queryset = VirtualMachine.objects.filter(cluster=cluster)
+            if tenant is not None:
+                queryset = queryset.filter(tenant=tenant)
+            if name_prefix:
+                queryset = queryset.filter(name__startswith=name_prefix)
 
-        netbox_vms = list(queryset.order_by("name"))
-        if not netbox_vms:
-            self.log_info("No NetBox VMs matched the selected filters")
-            return "No matching NetBox VMs found"
+            netbox_vms = list(queryset.order_by("name"))
+            if not netbox_vms:
+                self.log_info("No NetBox VMs matched the selected filters")
+                return "No matching NetBox VMs found"
 
-        connection_cache = {}
-        created_count = 0
-        updated_count = 0
-        unchanged_count = 0
-        failed_count = 0
+            connection_cache = {}
+            created_count = 0
+            updated_count = 0
+            unchanged_count = 0
+            failed_count = 0
 
-        for vm in netbox_vms:
+            for vm in netbox_vms:
+                try:
+                    conn = self._get_connection_for_vm(openstack, data, vm, connection_cache)
+                    result = self._sync_vm(
+                        conn=conn,
+                        vm=vm,
+                        data=data,
+                        commit=commit,
+                    )
+                    if result == "created":
+                        created_count += 1
+                    elif result == "updated":
+                        updated_count += 1
+                    else:
+                        unchanged_count += 1
+                except Exception as exc:
+                    failed_count += 1
+                    self.log_failure(f"Failed to sync NetBox VM {vm.name}: {exc}", vm)
+
+            return (
+                f"NetBox to OpenStack sync complete: "
+                f"created={created_count}, "
+                f"updated={updated_count}, "
+                f"unchanged={unchanged_count}, "
+                f"failed={failed_count}, "
+                f"dry_run={'yes' if not commit else 'no'}"
+            )
+
+    @contextmanager
+    def _openvpn_tunnel(self, uploaded_profile):
+        if uploaded_profile is None:
+            yield None
+            return
+
+        with tempfile.TemporaryDirectory(prefix="netbox-openvpn-") as temp_dir:
+            profile_path = Path(temp_dir) / "uploaded-profile.ovpn"
+            self._write_uploaded_profile(uploaded_profile, profile_path)
+            self.log_info(f"Starting OpenVPN tunnel from uploaded profile {getattr(uploaded_profile, 'name', profile_path.name)}")
+            proc = self._start_openvpn(profile_path)
             try:
-                conn = self._get_connection_for_vm(openstack, data, vm, connection_cache)
-                result = self._sync_vm(
-                    conn=conn,
-                    vm=vm,
-                    data=data,
-                    commit=commit,
-                )
-                if result == "created":
-                    created_count += 1
-                elif result == "updated":
-                    updated_count += 1
-                else:
-                    unchanged_count += 1
-            except Exception as exc:
-                failed_count += 1
-                self.log_failure(f"Failed to sync NetBox VM {vm.name}: {exc}", vm)
+                yield proc
+            finally:
+                self._stop_openvpn(proc)
 
-        return (
-            f"NetBox to OpenStack sync complete: "
-            f"created={created_count}, "
-            f"updated={updated_count}, "
-            f"unchanged={unchanged_count}, "
-            f"failed={failed_count}, "
-            f"dry_run={'yes' if not commit else 'no'}"
-        )
+    def _write_uploaded_profile(self, uploaded_profile, profile_path):
+        if hasattr(uploaded_profile, "chunks"):
+            with profile_path.open("wb") as handle:
+                for chunk in uploaded_profile.chunks():
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode()
+                    handle.write(chunk)
+        else:
+            content = uploaded_profile.read()
+            if isinstance(content, str):
+                content = content.encode()
+            profile_path.write_bytes(content)
+
+        profile_path.chmod(0o600)
+
+    def _openvpn_binary(self):
+        return (os.environ.get("OPENVPN_BINARY") or "openvpn").strip() or "openvpn"
+
+    def _openvpn_start_timeout(self):
+        raw_timeout = (os.environ.get("OPENVPN_START_TIMEOUT") or "90").strip()
+        try:
+            timeout = int(raw_timeout)
+        except (TypeError, ValueError):
+            timeout = 90
+        return max(timeout, 1)
+
+    def _start_openvpn(self, profile_path):
+        command = [
+            self._openvpn_binary(),
+            "--config",
+            str(profile_path),
+            "--verb",
+            "3",
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            raise AbortScript(
+                f"OpenVPN binary not found: {command[0]}. Install openvpn or set OPENVPN_BINARY to the full path."
+            ) from exc
+        except Exception as exc:
+            raise AbortScript(f"Could not start OpenVPN: {exc}") from exc
+
+        if proc.stdout is None:
+            self._stop_openvpn(proc)
+            raise AbortScript("OpenVPN did not expose stdout, cannot monitor tunnel startup")
+
+        deadline = time.monotonic() + self._openvpn_start_timeout()
+        output = []
+
+        while True:
+            if proc.poll() is not None:
+                last_output = "\n".join(output[-20:])
+                raise AbortScript(
+                    "OpenVPN exited before the tunnel was established"
+                    + (f". Last output:\n{last_output}" if last_output else "")
+                )
+
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.rstrip()
+                    output.append(line)
+                    self.log_info(f"[openvpn] {line}")
+
+                    if "Initialization Sequence Completed" in line:
+                        self.log_success("OpenVPN tunnel established")
+                        return proc
+
+                    if "AUTH_FAILED" in line or "Exiting due to fatal error" in line:
+                        raise AbortScript(
+                            "OpenVPN reported a startup failure"
+                            + (f". Last output: {line}" if line else "")
+                        )
+
+            if time.monotonic() > deadline:
+                last_output = "\n".join(output[-20:])
+                self._stop_openvpn(proc)
+                raise AbortScript(
+                    "Timed out waiting for OpenVPN tunnel to initialize"
+                    + (f". Last output:\n{last_output}" if last_output else "")
+                )
+
+    def _stop_openvpn(self, proc):
+        if proc is None or proc.poll() is not None:
+            return
+
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception:
+                pass
 
     def _sync_vm(self, conn, vm, data, commit):
         server = self._find_server_for_vm(conn, vm)
