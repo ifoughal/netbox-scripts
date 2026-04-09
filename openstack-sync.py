@@ -148,9 +148,6 @@ class SyncNetBoxVMsToOpenStack(Script):
         except ImportError as exc:
             raise AbortScript("openstacksdk is not installed in the NetBox Python environment") from exc
 
-        self.log_info("sleeping for 5 minutes to allow for any transient OpenVPN connectivity issues to resolve before syncing")
-        time.sleep(300)
-
         with self._openvpn_tunnel(data.get("vpn_profile")):
             cluster = data["cluster"]
             tenant = data.get("tenant")
@@ -211,6 +208,10 @@ class SyncNetBoxVMsToOpenStack(Script):
         with tempfile.TemporaryDirectory(prefix="netbox-openvpn-") as temp_dir:
             profile_path = Path(temp_dir) / "uploaded-profile.ovpn"
             self._write_uploaded_profile(uploaded_profile, profile_path)
+
+            self.log_info("sleeping for 5 minutes to allow for any transient OpenVPN connectivity issues to resolve before syncing")
+            time.sleep(300)
+
             self.log_info(f"Starting OpenVPN tunnel from uploaded profile {getattr(uploaded_profile, 'name', profile_path.name)}")
             proc = self._start_openvpn(profile_path)
             try:
