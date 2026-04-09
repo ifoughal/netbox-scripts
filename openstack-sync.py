@@ -159,7 +159,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             tenant = data.get("tenant")
             name_prefix = (data.get("name_prefix") or "").strip()
 
-
             queryset = VirtualMachine.objects.filter(cluster=cluster)
             if tenant is not None:
                 queryset = queryset.filter(tenant=tenant)
@@ -179,9 +178,13 @@ class SyncNetBoxVMsToOpenStack(Script):
 
             for vm in netbox_vms:
                 try:
-                    conn = self._get_connection_for_vm(openstack, data, vm, connection_cache)
                     result = self._sync_vm(
-                        conn=conn,
+                        conn=self._get_connection_for_vm(
+                            openstack,
+                            data,
+                            vm,
+                            connection_cache
+                        ),
                         vm=vm,
                         data=data,
                         commit=commit,
@@ -330,6 +333,7 @@ class SyncNetBoxVMsToOpenStack(Script):
 
     def _sync_vm(self, conn, vm, data, commit):
         server = self._find_server_for_vm(conn, vm)
+        self.log_info(f"Syncing NetBox VM {vm.name} to OpenStack instance {getattr(server, 'name', None) or server.id if server else '<none>'}")
         desired_name = vm.name
         changes = []
 
