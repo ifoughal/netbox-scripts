@@ -417,22 +417,24 @@ class OpenStackInstance:
         return cls._metadata_scalar(value)
 
     def update_name(self, desired_name, commit, change_rows=None, record_change=None, nb_vm=None):
-        change_rows = change_rows or []
+        if change_rows is None:
+            change_rows = []
         current_name = self.name or ""
         if current_name == desired_name:
+            if record_change is not None and nb_vm is not None:
+                record_change(
+                    change_rows,
+                    nb_vm,
+                    self,
+                    "rename",
+                    "name",
+                    current_name or "<empty>",
+                    desired_name,
+                    commit,
+                    details="matched",
+                    state="matched",
+                )
             return False
-
-        if record_change is not None and nb_vm is not None:
-            record_change(
-                change_rows,
-                nb_vm,
-                self,
-                "rename",
-                "name",
-                current_name or "<empty>",
-                desired_name,
-                commit,
-            )
 
         if commit:
             updated = self.conn.compute.update_server(self.resource, name=desired_name)
@@ -450,7 +452,8 @@ class OpenStackInstance:
         return True
 
     def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None, sync_debug=False, log_debug=None):
-        change_rows = change_rows or []
+        if change_rows is None:
+            change_rows = []
         current_metadata = dict(self.metadata)
 
         if sync_debug and log_debug is not None and nb_vm is not None:
@@ -462,19 +465,30 @@ class OpenStackInstance:
             self.log_snapshot(log_debug, nb_vm)
 
         pending = {}
-        matched_rows = []
         for key, value in desired_metadata.items():
             current_value = current_metadata.get(key)
             current_normalized = self._normalize_metadata_value(key, current_value)
             desired_normalized = self._normalize_metadata_value(key, value)
 
             if current_normalized == desired_normalized:
+                if record_change is not None and nb_vm is not None:
+                    record_change(
+                        change_rows,
+                        nb_vm,
+                        self,
+                        "metadata",
+                        key,
+                        current_normalized,
+                        desired_normalized,
+                        commit,
+                        details="matched",
+                        state="matched",
+                    )
                 if sync_debug and log_debug is not None and nb_vm is not None:
                     log_debug(
                         f"Metadata {key} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
                     )
-                matched_rows.append((key, current_normalized, desired_normalized))
                 continue
 
             pending[key] = desired_normalized
@@ -491,20 +505,6 @@ class OpenStackInstance:
                 )
 
         if not pending:
-            if record_change is not None and nb_vm is not None:
-                for key, current_normalized, desired_normalized in matched_rows:
-                    record_change(
-                        change_rows,
-                        nb_vm,
-                        self,
-                        "metadata",
-                        key,
-                        current_normalized,
-                        desired_normalized,
-                        commit,
-                        details="matched",
-                        state="matched",
-                    )
             return False
 
         if commit:
@@ -523,7 +523,8 @@ class OpenStackInstance:
         return True
 
     def sync_power_state(self, desired_status, commit, change_rows=None, record_change=None, nb_vm=None):
-        change_rows = change_rows or []
+        if change_rows is None:
+            change_rows = []
         actual = self._metadata_scalar(self.status).upper()
 
         if desired_status == "ACTIVE" and actual == "SHUTOFF":
@@ -565,6 +566,20 @@ class OpenStackInstance:
                 if isinstance(self.raw, dict):
                     self.raw["status"] = desired_status
             return True
+
+        if record_change is not None and nb_vm is not None:
+            record_change(
+                change_rows,
+                nb_vm,
+                self,
+                "power",
+                "status",
+                actual,
+                desired_status,
+                commit,
+                details="matched",
+                state="matched",
+            )
 
         return False
 
@@ -954,7 +969,10 @@ class SyncNetBoxVMsToOpenStack(Script):
         if actual_change_count == 0:
             summary_suffix = f"(0 changes, {comparison_count} field comparison{'s' if comparison_count != 1 else ''})"
         else:
-            summary_suffix = f"({actual_change_count} change{'s' if actual_change_count != 1 else ''})"
+            summary_suffix = (
+                f"({actual_change_count} change{'s' if actual_change_count != 1 else ''}, "
+                f"{comparison_count} field comparison{'s' if comparison_count != 1 else ''})"
+            )
 
         self.log_info(
             f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} {summary_suffix}",
@@ -1109,6 +1127,19 @@ class SyncNetBoxVMsToOpenStack(Script):
             )
             if commit:
                 self._update_vm_openstack_id(nb_vm, os_instance.id, commit=True)
+        else:
+            self._record_change(
+                change_rows,
+                nb_vm,
+                os_instance,
+                "identity",
+                "openstack_id",
+                openstack_id,
+                os_instance.id,
+                commit,
+                details="matched",
+                state="matched",
+            )
 
         if data.get("allow_rename"):
             changed = os_instance.update_name(
