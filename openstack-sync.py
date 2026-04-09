@@ -165,8 +165,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             if name_prefix:
                 queryset = queryset.filter(name__startswith=name_prefix)
 
-            netbox_vms = list(queryset.order_by("name"))
-            if not netbox_vms:
+            nb_vms = list(queryset.order_by("name"))
+            if not nb_vms:
                 self.log_info("No NetBox VMs matched the selected filters")
                 return "No matching NetBox VMs found"
 
@@ -176,16 +176,16 @@ class SyncNetBoxVMsToOpenStack(Script):
             unchanged_count = 0
             failed_count = 0
 
-            for vm in netbox_vms:
+            for nb_vm in nb_vms:
                 try:
                     result = self._sync_vm(
                         conn=self._get_connection_for_vm(
                             openstack,
                             data,
-                            vm,
+                            nb_vm,
                             connection_cache
                         ),
-                        vm=vm,
+                        nb_vm=nb_vm,
                         data=data,
                         commit=commit,
                     )
@@ -197,7 +197,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                         unchanged_count += 1
                 except Exception as exc:
                     failed_count += 1
-                    self.log_failure(f"Failed to sync NetBox VM {vm.name}: {exc}", vm)
+                    self.log_failure(f"Failed to sync NetBox VM {nb_vm.name}: {exc}", nb_vm)
 
             return (
                 f"NetBox to OpenStack sync complete: "
@@ -331,74 +331,90 @@ class SyncNetBoxVMsToOpenStack(Script):
             except Exception:
                 pass
 
-    def _sync_vm(self, conn, vm, data, commit):
-        server = self._find_server_for_vm(conn, vm)
-        self.log_info(f"Syncing NetBox VM {vm.name} to OpenStack instance {getattr(server, 'name', None) or server.id if server else '<none>'}")
+    def _nb_vm_ref(self, nb_vm):
+        return f"NetBox VM {nb_vm.name} (id={nb_vm.pk})"
 
-        desired_name = vm.name
-        changes = []
+    def _os_server_ref(self, os_server):
+        server_name = getattr(os_server, "name", None) or "<unnamed>"
+        server_id = getattr(os_server, "id", None) or "<unknown>"
+        return f"OpenStack server {server_name} (id={server_id})"
 
-        if server is None:
+    def _sync_vm(self, conn, nb_vm, data, commit):
+        os_server = self._find_server_for_vm(conn, nb_vm)
+        nb_vm_ref = self._nb_vm_ref(nb_vm)
+        desired_name = nb_vm.name
+
+        if os_server is None:
+            self.log_info(f"No matching OpenStack server found for {nb_vm_ref}")
             if not data.get("allow_create"):
                 self.log_warning(
-                    f"No matching OpenStack instance found for NetBox VM {vm.name}. "
+                    f"No matching OpenStack server found for {nb_vm_ref}. "
                     f"Creation is disabled."
                 )
                 return "unchanged"
 
-            creation_resources = self._resolve_creation_resources(conn, data, vm)
+            creation_resources = self._resolve_creation_resources(conn, data, nb_vm)
             image = creation_resources["image"]
             flavor = creation_resources["flavor"]
             network = creation_resources["network"]
-
-            change_message = (
-                f"Create OpenStack instance for NetBox VM {vm.name} "
+            create_message = (
+                f"Create OpenStack server for {nb_vm_ref} "
                 f"using image={image.name}, flavor={flavor.name}, network={network.name}"
             )
-            if not commit:
-                self.log_info(f"[dry-run] {change_message}")
+
+            if commit:
+                self.log_info(create_message)
+            else:
+                self.log_info(f"[dry-run] {create_message}")
                 return "created"
 
-            server = self._create_server(conn, vm, data, image, flavor, network)
-            changes.append("created_instance")
-            self._update_vm_openstack_id(vm, server.id, commit=True)
-            self.log_success(f"Created OpenStack instance {server.name} for NetBox VM {vm.name}", vm)
+            os_server = self._create_server(conn, nb_vm, data, image, flavor, network)
+            self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
+            self.log_success(f"Created {self._os_server_ref(os_server)} for {nb_vm_ref}", nb_vm)
             return "created"
 
-        openstack_id = self._get_vm_openstack_id(vm)
-        if openstack_id != str(server.id):
+        os_server_ref = self._os_server_ref(os_server)
+        changed = False
+
+        openstack_id = self._get_vm_openstack_id(nb_vm)
+        if openstack_id != str(os_server.id):
+            changed = True
             if commit:
-                self._update_vm_openstack_id(vm, server.id, commit=True)
-                changes.append("saved_openstack_id_to_netbox")
+                self.log_info(
+                    f"Updating openstack_id on {nb_vm_ref} from {openstack_id or '<empty>'} "
+                    f"to {os_server.id} to match {os_server_ref}"
+                )
+                self._update_vm_openstack_id(nb_vm, os_server.id, commit=True)
+                self.log_success(
+                    f"Updated openstack_id on {nb_vm_ref} to {os_server.id} using {os_server_ref}",
+                    nb_vm,
+                )
             else:
                 self.log_info(
-                    f"[dry-run] Would store OpenStack instance UUID {server.id} in NetBox custom field openstack_id for {vm.name}"
+                    f"[dry-run] Would update openstack_id on {nb_vm_ref} from {openstack_id or '<empty>'} "
+                    f"to {os_server.id} to match {os_server_ref}"
                 )
-                changes.append("save_openstack_id_to_netbox")
 
-        if data.get("allow_rename") and (server.name or "") != desired_name:
-            changes.append(f"rename:{server.name}->{desired_name}")
+        if data.get("allow_rename") and (os_server.name or "") != desired_name:
+            changed = True
             if commit:
-                server = conn.compute.update_server(server, name=desired_name)
-                self.log_info(f"Renamed OpenStack instance {server.id} to {desired_name}")
+                self.log_info(f"Renaming {os_server_ref} to {desired_name} for {nb_vm_ref}")
+                os_server = conn.compute.update_server(os_server, name=desired_name)
+                os_server_ref = self._os_server_ref(os_server)
+                self.log_success(f"Renamed {os_server_ref} to match {nb_vm_ref}", nb_vm)
+            else:
+                self.log_info(f"[dry-run] Would rename {os_server_ref} to {desired_name} for {nb_vm_ref}")
 
         if data.get("update_metadata"):
-            metadata_changes = self._sync_metadata(conn, server, vm, commit)
-            changes.extend(metadata_changes)
+            changed = self._sync_metadata(conn, os_server, nb_vm, commit) or changed
 
         if data.get("sync_power_state"):
-            power_change = self._sync_power_state(conn, server, vm, commit)
-            if power_change:
-                changes.append(power_change)
+            changed = self._sync_power_state(conn, os_server, nb_vm, commit) or changed
 
-        if not changes:
-            self.log_info(f"No changes needed for NetBox VM {vm.name}")
+        if not changed:
+            self.log_info(f"No changes needed for {nb_vm_ref} against {os_server_ref}")
             return "unchanged"
 
-        if not commit:
-            self.log_info(f"[dry-run] Would apply to {vm.name}: {', '.join(changes)}")
-        else:
-            self.log_success(f"Synchronized {vm.name}: {', '.join(changes)}", vm)
         return "updated"
 
     def _build_openstack_conn_kwargs(self, data, region_name=None, project_id=None, project_name=None):
@@ -442,42 +458,42 @@ class SyncNetBoxVMsToOpenStack(Script):
         connection_cache[base_key] = base_conn
         return base_conn
 
-    def _resolve_project_resource(self, conn, project_id, project_name, vm_name):
+    def _resolve_project_resource(self, conn, project_id, project_name, nb_vm_name):
         lookup_error = None
 
         if project_id:
             try:
-                project = conn.identity.get_project(project_id)
+                os_project = conn.identity.get_project(project_id)
             except Exception as exc:
                 lookup_error = exc
             else:
-                if project is not None:
-                    return project
+                if os_project is not None:
+                    return os_project
 
         if project_name:
             try:
-                for project in conn.identity.projects():
-                    if (getattr(project, "name", None) or "") == project_name:
-                        return project
+                for os_project in conn.identity.projects():
+                    if (getattr(os_project, "name", None) or "") == project_name:
+                        return os_project
             except Exception as exc:
                 lookup_error = exc
 
         project_ref = project_id or project_name or "<unknown>"
         if lookup_error is not None:
             raise AbortScript(
-                f"Could not resolve OpenStack project {project_ref} for VM {vm_name}: {lookup_error}"
+                f"Could not resolve OpenStack project {project_ref} for VM {nb_vm_name}: {lookup_error}"
             ) from lookup_error
 
-        raise AbortScript(f"Could not resolve OpenStack project {project_ref} for VM {vm_name}")
+        raise AbortScript(f"Could not resolve OpenStack project {project_ref} for VM {nb_vm_name}")
 
-    def _get_connection_for_vm(self, openstack, data, vm, connection_cache):
-        project_id = self._get_vm_cf_value(vm, "openstack_project_id")
-        project_name = self._get_vm_cf_value(vm, "openstack_project_name")
-        region_name = self._get_vm_cf_value(vm, "openstack_location_region")
+    def _get_connection_for_vm(self, openstack, data, nb_vm, connection_cache):
+        project_id = self._get_vm_cf_value(nb_vm, "openstack_project_id")
+        project_name = self._get_vm_cf_value(nb_vm, "openstack_project_name")
+        region_name = self._get_vm_cf_value(nb_vm, "openstack_location_region")
 
         if not project_id and not project_name:
             raise AbortScript(
-                f"NetBox VM {vm.name} is missing custom field openstack_project_id or openstack_project_name"
+                f"NetBox VM {nb_vm.name} is missing custom field openstack_project_id or openstack_project_name"
             )
 
         raw_cache_key = (project_id or "", project_name or "", region_name or "")
@@ -486,8 +502,8 @@ class SyncNetBoxVMsToOpenStack(Script):
             return cached
 
         base_conn = self._get_base_connection(openstack, data, region_name, connection_cache)
-        project = self._resolve_project_resource(base_conn, project_id, project_name, vm.name)
-        resolved_project_id = getattr(project, "id", None) or project_id or project_name or ""
+        os_project = self._resolve_project_resource(base_conn, project_id, project_name, nb_vm.name)
+        resolved_project_id = getattr(os_project, "id", None) or project_id or project_name or ""
         cache_key = (resolved_project_id, region_name or "")
         cached = connection_cache.get(cache_key)
         if cached is not None:
@@ -496,10 +512,10 @@ class SyncNetBoxVMsToOpenStack(Script):
 
         if hasattr(base_conn, "connect_as_project"):
             try:
-                conn = base_conn.connect_as_project(project)
+                conn = base_conn.connect_as_project(os_project)
             except Exception as exc:
                 raise AbortScript(
-                    f"Could not switch OpenStack session to project {resolved_project_id} for VM {vm.name}: {exc}"
+                    f"Could not switch OpenStack session to project {resolved_project_id} for VM {nb_vm.name}: {exc}"
                 ) from exc
         else:
             conn_kwargs = self._build_openstack_conn_kwargs(
@@ -512,25 +528,25 @@ class SyncNetBoxVMsToOpenStack(Script):
                 conn = openstack.connect(**conn_kwargs)
             except Exception as exc:
                 raise AbortScript(
-                    f"Could not authenticate to OpenStack for VM {vm.name}: {exc}"
+                    f"Could not authenticate to OpenStack for VM {nb_vm.name}: {exc}"
                 ) from exc
 
         connection_cache[raw_cache_key] = conn
         connection_cache[cache_key] = conn
         return conn
 
-    def _resolve_creation_resources(self, conn, data, vm):
+    def _resolve_creation_resources(self, conn, data, nb_vm):
         image_name = (
-            self._get_vm_cf_value(vm, "openstack_image")
-            or self._get_vm_cf_value(vm, "openstack_image_name")
+            self._get_vm_cf_value(nb_vm, "openstack_image")
+            or self._get_vm_cf_value(nb_vm, "openstack_image_name")
             or (data.get("image_name") or "").strip()
         )
         network_name = (
-            self._get_vm_cf_value(vm, "openstack_network")
-            or self._get_vm_cf_value(vm, "openstack_network_name")
+            self._get_vm_cf_value(nb_vm, "openstack_network")
+            or self._get_vm_cf_value(nb_vm, "openstack_network_name")
             or (data.get("network_name") or "").strip()
         )
-        flavor_name = self._get_vm_cf_value(vm, "openstack_flavor")
+        flavor_name = self._get_vm_cf_value(nb_vm, "openstack_flavor")
 
         missing = []
         if not image_name:
@@ -541,20 +557,20 @@ class SyncNetBoxVMsToOpenStack(Script):
             missing.append("custom field openstack_flavor")
         if missing:
             raise AbortScript(
-                f"Creation is enabled for VM {vm.name} but required values are missing: {', '.join(missing)}"
+                f"Creation is enabled for VM {nb_vm.name} but required values are missing: {', '.join(missing)}"
             )
 
         image = conn.image.find_image(image_name)
         if image is None:
-            raise AbortScript(f"OpenStack image not found for VM {vm.name}: {image_name}")
+            raise AbortScript(f"OpenStack image not found for VM {nb_vm.name}: {image_name}")
 
         flavor = conn.compute.find_flavor(flavor_name)
         if flavor is None:
-            raise AbortScript(f"OpenStack flavor not found for VM {vm.name}: {flavor_name}")
+            raise AbortScript(f"OpenStack flavor not found for VM {nb_vm.name}: {flavor_name}")
 
         network = conn.network.find_network(network_name)
         if network is None:
-            raise AbortScript(f"OpenStack network not found for VM {vm.name}: {network_name}")
+            raise AbortScript(f"OpenStack network not found for VM {nb_vm.name}: {network_name}")
 
         return {
             "image": image,
@@ -562,99 +578,112 @@ class SyncNetBoxVMsToOpenStack(Script):
             "network": network,
         }
 
-    def _find_server_for_vm(self, conn, vm):
-        openstack_id = self._get_vm_openstack_id(vm)
+    def _find_server_for_vm(self, conn, nb_vm):
+        openstack_id = self._get_vm_openstack_id(nb_vm)
         if openstack_id:
-            server = conn.compute.find_server(openstack_id, ignore_missing=True)
-            if server is not None:
-                return server
+            os_server = conn.compute.find_server(openstack_id, ignore_missing=True)
+            if os_server is not None:
+                return os_server
 
-        serial = (vm.serial or "").strip()
+        serial = (nb_vm.serial or "").strip()
         if serial:
-            server = conn.compute.find_server(serial, ignore_missing=True)
-            if server is not None:
-                return server
+            os_server = conn.compute.find_server(serial, ignore_missing=True)
+            if os_server is not None:
+                return os_server
 
         try:
-            return conn.compute.find_server(vm.name, ignore_missing=True)
+            return conn.compute.find_server(nb_vm.name, ignore_missing=True)
         except Exception:
             return None
 
-    def _create_server(self, conn, vm, data, image, flavor, network):
+    def _create_server(self, conn, nb_vm, data, image, flavor, network):
         create_args = {
-            "name": vm.name,
+            "name": nb_vm.name,
             "image_id": image.id,
             "flavor_id": flavor.id,
             "networks": [{"uuid": network.id}],
         }
 
-        key_name = self._get_vm_cf_value(vm, "key_name")
+        key_name = self._get_vm_cf_value(nb_vm, "key_name")
         if key_name:
             create_args["key_name"] = key_name
 
-        availability_zone = self._get_vm_cf_first(vm, "openstack_availability_zone") or self._get_vm_cf_value(vm, "openstack_location_zone")
+        availability_zone = self._get_vm_cf_first(nb_vm, "openstack_availability_zone") or self._get_vm_cf_value(nb_vm, "openstack_location_zone")
         if availability_zone:
             create_args["availability_zone"] = availability_zone
 
-        security_groups = self._get_vm_cf_list(vm, "openstack_security_groups")
+        security_groups = self._get_vm_cf_list(nb_vm, "openstack_security_groups")
         if security_groups:
             create_args["security_groups"] = [{"name": group_name} for group_name in security_groups]
 
-        server = conn.compute.create_server(**create_args)
+        os_server = conn.compute.create_server(**create_args)
 
         if data.get("wait_for_active"):
-            server = conn.compute.wait_for_server(
-                server,
+            os_server = conn.compute.wait_for_server(
+                os_server,
                 status="ACTIVE",
                 failures=["ERROR"],
                 wait=600,
             )
 
         if data.get("update_metadata"):
-            self._sync_metadata(conn, server, vm, commit=True)
+            self._sync_metadata(conn, os_server, nb_vm, commit=True)
 
         if data.get("sync_power_state"):
-            self._sync_power_state(conn, server, vm, commit=True)
+            self._sync_power_state(conn, os_server, nb_vm, commit=True)
 
-        return server
+        return os_server
 
-    def _sync_metadata(self, conn, server, vm, commit):
-        desired_metadata = self._desired_metadata(vm)
-        current_metadata_resource = conn.compute.get_server_metadata(server)
+    def _sync_metadata(self, conn, os_server, nb_vm, commit):
+        desired_metadata = self._desired_metadata(nb_vm)
+        current_metadata_resource = conn.compute.get_server_metadata(os_server)
         current_metadata = getattr(current_metadata_resource, "metadata", {}) or {}
 
-        changed = []
         pending = {}
         for key, value in desired_metadata.items():
-            if current_metadata.get(key) != value:
+            current_value = current_metadata.get(key)
+            if current_value != value:
                 pending[key] = value
-                changed.append(f"metadata:{key}")
+                if commit:
+                    self.log_info(
+                        f"Updating metadata {key} on {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}: "
+                        f"{current_value!r} -> {value!r}"
+                    )
+                else:
+                    self.log_info(
+                        f"[dry-run] Would update metadata {key} on {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}: "
+                        f"{current_value!r} -> {value!r}"
+                    )
 
         if not pending:
-            return []
+            return False
 
         if commit:
-            conn.compute.set_server_metadata(server, **pending)
-        return changed
+            conn.compute.set_server_metadata(os_server, **pending)
+            self.log_success(
+                f"Applied metadata updates to {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}",
+                nb_vm,
+            )
+        return True
 
-    def _desired_metadata(self, vm):
+    def _desired_metadata(self, nb_vm):
         metadata = {
-            "netbox_vm_id": str(vm.pk),
-            "netbox_vm_name": vm.name,
-            "netbox_cluster": vm.cluster.name if vm.cluster else "",
-            "netbox_status": str(getattr(vm.status, "value", vm.status)),
+            "netbox_vm_id": str(nb_vm.pk),
+            "netbox_vm_name": nb_vm.name,
+            "netbox_cluster": nb_vm.cluster.name if nb_vm.cluster else "",
+            "netbox_status": str(getattr(nb_vm.status, "value", nb_vm.status)),
         }
 
-        if vm.tenant:
-            metadata["netbox_tenant"] = vm.tenant.name
-        if vm.role:
-            metadata["netbox_role"] = vm.role.name
-        if vm.vcpus is not None:
-            metadata["netbox_vcpus"] = str(vm.vcpus)
-        if vm.memory is not None:
-            metadata["netbox_memory_mb"] = str(vm.memory)
-        if vm.disk is not None:
-            metadata["netbox_disk_mb"] = str(vm.disk)
+        if nb_vm.tenant:
+            metadata["netbox_tenant"] = nb_vm.tenant.name
+        if nb_vm.role:
+            metadata["netbox_role"] = nb_vm.role.name
+        if nb_vm.vcpus is not None:
+            metadata["netbox_vcpus"] = str(nb_vm.vcpus)
+        if nb_vm.memory is not None:
+            metadata["netbox_memory_mb"] = str(nb_vm.memory)
+        if nb_vm.disk is not None:
+            metadata["netbox_disk_mb"] = str(nb_vm.disk)
 
         for field_name in (
             "hostname",
@@ -664,75 +693,97 @@ class SyncNetBoxVMsToOpenStack(Script):
             "openstack_location_region",
             "openstack_location_zone",
         ):
-            value = self._get_vm_cf_value(vm, field_name)
+            value = self._get_vm_cf_value(nb_vm, field_name)
             if value:
                 metadata[field_name] = str(value)
 
         return metadata
 
-    def _sync_power_state(self, conn, server, vm, commit):
-        desired = self._desired_server_status(vm)
-        actual = str(getattr(server, "status", "")).upper()
+    def _sync_power_state(self, conn, os_server, nb_vm, commit):
+        desired = self._desired_server_status(nb_vm)
+        actual = str(getattr(os_server, "status", "")).upper()
 
         if desired == "ACTIVE" and actual == "SHUTOFF":
             if commit:
-                conn.compute.start_server(server)
-            return "power:start"
+                self.log_info(
+                    f"Starting {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                )
+                conn.compute.start_server(os_server)
+                self.log_success(
+                    f"Started {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}",
+                    nb_vm,
+                )
+            else:
+                self.log_info(
+                    f"[dry-run] Would start {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                )
+            return True
 
         if desired == "SHUTOFF" and actual == "ACTIVE":
             if commit:
-                conn.compute.stop_server(server)
-            return "power:stop"
+                self.log_info(
+                    f"Stopping {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                )
+                conn.compute.stop_server(os_server)
+                self.log_success(
+                    f"Stopped {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)}",
+                    nb_vm,
+                )
+            else:
+                self.log_info(
+                    f"[dry-run] Would stop {self._os_server_ref(os_server)} for {self._nb_vm_ref(nb_vm)} to match status {desired}"
+                )
+            return True
 
-        return None
+        return False
 
-    def _desired_server_status(self, vm):
-        status_value = str(getattr(vm.status, "value", vm.status)).lower()
+    def _desired_server_status(self, nb_vm):
+        status_value = str(getattr(nb_vm.status, "value", nb_vm.status)).lower()
         if status_value == "offline":
             return "SHUTOFF"
         return "ACTIVE"
 
-    def _get_vm_openstack_id(self, vm):
-        return self._get_vm_cf_value(vm, "openstack_id") or (vm.serial or "").strip()
+    def _get_vm_openstack_id(self, nb_vm):
+        return self._get_vm_cf_value(nb_vm, "openstack_id") or (nb_vm.serial or "").strip()
 
-    def _update_vm_openstack_id(self, vm, server_id, commit):
-        self._set_vm_cf_value(vm, "openstack_id", str(server_id))
-        vm.serial = str(server_id)
-        vm.full_clean()
-        vm.save()
+    def _update_vm_openstack_id(self, nb_vm, server_id, commit):
+        self._set_vm_cf_value(nb_vm, "openstack_id", str(server_id))
+        nb_vm.serial = str(server_id)
+        nb_vm.full_clean()
+        nb_vm.save()
 
-    def _get_vm_cf_data(self, vm):
-        data = getattr(vm, "custom_field_data", None)
+    def _get_vm_cf_data(self, nb_vm):
+        data = getattr(nb_vm, "custom_field_data", None)
         if isinstance(data, dict):
             return data
-        data = getattr(vm, "cf", None)
+        data = getattr(nb_vm, "cf", None)
         if isinstance(data, dict):
             return data
         return {}
 
-    def _get_vm_cf_value(self, vm, field_name):
-        value = self._get_vm_cf_data(vm).get(field_name)
+    def _get_vm_cf_value(self, nb_vm, field_name):
+        value = self._get_vm_cf_data(nb_vm).get(field_name)
         if value in (None, "", []):
             return None
         if isinstance(value, list) and len(value) == 1:
             return value[0]
         return value
 
-    def _get_vm_cf_first(self, vm, field_name):
-        value = self._get_vm_cf_data(vm).get(field_name)
+    def _get_vm_cf_first(self, nb_vm, field_name):
+        value = self._get_vm_cf_data(nb_vm).get(field_name)
         if isinstance(value, list):
             return value[0] if value else None
         return value
 
-    def _get_vm_cf_list(self, vm, field_name):
-        value = self._get_vm_cf_data(vm).get(field_name)
+    def _get_vm_cf_list(self, nb_vm, field_name):
+        value = self._get_vm_cf_data(nb_vm).get(field_name)
         if value in (None, ""):
             return []
         if isinstance(value, list):
             return [item for item in value if item not in (None, "")]
         return [value]
 
-    def _set_vm_cf_value(self, vm, field_name, value):
-        data = dict(self._get_vm_cf_data(vm))
+    def _set_vm_cf_value(self, nb_vm, field_name, value):
+        data = dict(self._get_vm_cf_data(nb_vm))
         data[field_name] = value
-        setattr(vm, "custom_field_data", data)
+        setattr(nb_vm, "custom_field_data", data)
