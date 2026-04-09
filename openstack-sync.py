@@ -1,3 +1,4 @@
+import json
 import html
 from contextlib import contextmanager
 import os
@@ -806,6 +807,14 @@ class SyncNetBoxVMsToOpenStack(Script):
         desired_metadata = self._desired_metadata(nb_vm)
         current_metadata_resource = conn.compute.get_server_metadata(os_server)
         current_metadata = getattr(current_metadata_resource, "metadata", {}) or {}
+
+        if sync_debug:
+            current_metadata_dump = json.dumps(current_metadata, indent=2, sort_keys=True)
+            self.log_debug(
+                f"Retrieved metadata for {self._os_server_ref(os_server)} and {self._nb_vm_ref(nb_vm)}:\n"
+                f"```json\n{current_metadata_dump}\n```",
+                obj=nb_vm,
+            )
 
         pending = {}
         for key, value in desired_metadata.items():
