@@ -591,11 +591,10 @@ class OpenStackInstance:
             return ",".join(cls._security_group_names(value))
         return cls._metadata_scalar(value)
 
-    def compare_field_groups(self, nb_vm, commit, change_rows=None, record_change=None):
+    def compare_field_groups(self, nb_vm, commit, change_rows=None, record_change=None, log_debug=None):
         """Compare sync-tracked and report-only OpenStack fields against NetBox."""
         if change_rows is None:
             change_rows = []
-        log_debug = self.log_debug
 
         drift_found = False
         for group_name, field_specs in FIELD_GROUPS.items():
@@ -634,7 +633,7 @@ class OpenStackInstance:
                             mode="match",
                             comparison_group=group_name,
                         )
-                    if nb_vm is not None:
+                    if nb_vm is not None and log_debug is not None:
                         log_debug(
                             f"OpenStack field {field_name} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                             obj=nb_vm,
@@ -656,7 +655,7 @@ class OpenStackInstance:
                         mode=mode,
                         comparison_group=group_name,
                     )
-                if nb_vm is not None:
+                if nb_vm is not None and log_debug is not None:
                     log_debug(
                         f"OpenStack field {field_name} differs on {self.ref()} for {self._nb_vm_ref(nb_vm)}: "
                         f"{current_normalized!r} != {desired_normalized!r}",
@@ -703,15 +702,14 @@ class OpenStackInstance:
 
         return True
 
-    def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None):
+    def sync_metadata(self, desired_metadata, commit, change_rows=None, record_change=None, nb_vm=None, log_debug=None):
         """Compare, report, and optionally merge the NetBox metadata payload."""
         if change_rows is None:
             change_rows = []
         current_metadata = dict(self.metadata)
         summary_skip_keys = METADATA_SUMMARY_SKIP_KEYS
-        log_debug = self.log_debug
 
-        if nb_vm is not None:
+        if nb_vm is not None and log_debug is not None:
             # Dump the raw metadata and normalized snapshot together when
             # debugging so a mismatch can be traced quickly.
             log_debug(
@@ -743,7 +741,7 @@ class OpenStackInstance:
                         details="matched",
                         state="matched",
                     )
-                if key not in summary_skip_keys and nb_vm is not None:
+                if key not in summary_skip_keys and nb_vm is not None and log_debug is not None:
                     log_debug(
                         f"Metadata {key} already matches on {self.ref()} for {self._nb_vm_ref(nb_vm)}: {desired_normalized!r}",
                         obj=nb_vm,
@@ -1542,6 +1540,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                     change_rows=change_rows,
                     record_change=self._record_change,
                     nb_vm=nb_vm,
+                    log_debug=self.log_debug,
                 )
             if data.get("sync_power_state"):
                 os_instance.sync_power_state(
@@ -1558,6 +1557,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 commit=commit,
                 change_rows=change_rows,
                 record_change=self._record_change,
+                log_debug=self.log_debug,
             )
             self._log_change_report(nb_vm, os_instance, change_rows, commit)
             self._log_change_summary(
@@ -1620,6 +1620,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 change_rows=change_rows,
                 record_change=self._record_change,
                 nb_vm=nb_vm,
+                log_debug=self.log_debug,
             ) or changed
 
         if data.get("sync_power_state"):
@@ -1639,6 +1640,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             commit=commit,
             change_rows=change_rows,
             record_change=self._record_change,
+            log_debug=self.log_debug,
         )
 
         self._log_change_report(nb_vm, os_instance, change_rows, commit)
