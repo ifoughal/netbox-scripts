@@ -628,9 +628,10 @@ class OpenStackInstance:
                             current_normalized,
                             desired_normalized,
                             commit,
-                            details=group_name,
+                            details="matched",
                             state="matched",
-                            mode=mode,
+                            mode="match",
+                            comparison_group=group_name,
                         )
                     if sync_debug and log_debug is not None and nb_vm is not None:
                         log_debug(
@@ -652,6 +653,7 @@ class OpenStackInstance:
                         commit,
                         details=group_name,
                         mode=mode,
+                        comparison_group=group_name,
                     )
                 if sync_debug and log_debug is not None and nb_vm is not None:
                     log_debug(
@@ -1205,7 +1207,7 @@ class SyncNetBoxVMsToOpenStack(Script):
         """Escape a summary value so it remains valid inside a Markdown table."""
         return html.escape(self._summary_value(value), quote=False).replace("|", "\\|").replace("\n", " ")
 
-    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details="", state="changed", mode=None):
+    def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details="", state="changed", mode=None, comparison_group=None):
         """Append a single comparison row to the summary accumulator."""
         openstack_text = self._summary_value(openstack_value)
         netbox_text = self._summary_value(netbox_value)
@@ -1223,6 +1225,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                 "details": details,
                 "state": state,
                 "mode": mode or ("apply" if commit else "dry-run"),
+                "comparison_group": comparison_group,
             }
         )
 
@@ -1251,10 +1254,10 @@ class SyncNetBoxVMsToOpenStack(Script):
         applied_change_count = sum(
             1
             for row in change_rows
-            if row.get("mode") not in {"report", "sync"} and row.get("state", "changed") != "matched"
+            if row.get("mode") not in {"report", "sync", "match"} and row.get("state", "changed") != "matched"
         )
-        to_sync_count = sum(1 for row in change_rows if row.get("mode") == "sync")
-        report_only_count = sum(1 for row in change_rows if row.get("mode") == "report")
+        to_sync_count = sum(1 for row in change_rows if row.get("comparison_group") == "to_sync")
+        report_only_count = sum(1 for row in change_rows if row.get("comparison_group") == "report_only")
         comparison_count = len(change_rows)
         # Count every comparison row, even matched ones, so the summary proves
         # which fields were checked and which ones were only reported.
