@@ -355,6 +355,21 @@ class SyncNetBoxVMsToOpenStack(Script):
     def _markdown_cell(self, value):
         return self._summary_value(value).replace("|", "\\|").replace("\n", " ")
 
+    def _change_heading(self, row):
+        change_type = row.get("change_type", "change")
+        field = row.get("field", "")
+        if change_type == "metadata":
+            return f"Metadata change: `{field}`"
+        if change_type == "identity":
+            return "Identity change: `openstack_id`"
+        if change_type == "rename":
+            return "Rename change: `name`"
+        if change_type == "power":
+            return "Power state change: `status`"
+        if change_type == "create":
+            return "Create change: `instance`"
+        return f"{change_type.title()} change: `{field}`"
+
     def _record_change(self, change_rows, nb_vm, os_server, change_type, field, openstack_value, netbox_value, commit, details=""):
         openstack_text = self._summary_value(openstack_value)
         netbox_text = self._summary_value(netbox_value)
@@ -379,18 +394,6 @@ class SyncNetBoxVMsToOpenStack(Script):
             return
 
         summary_target = self._os_server_ref(os_server) if os_server is not None else "<missing OpenStack server>"
-        headers = [
-            "VM",
-            "Server",
-            "Change",
-            "Field",
-            "OpenStack",
-            "NetBox",
-            "Diff",
-            "Mode",
-            "Details",
-        ]
-        table_rows = []
         change_order = {
             "create": 0,
             "identity": 1,
@@ -403,32 +406,41 @@ class SyncNetBoxVMsToOpenStack(Script):
             key=lambda item: (change_order.get(item[1]["change_type"], 99), item[0]),
         )
 
-        for _, row in ordered_rows:
-            table_rows.append(
-                [
-                    row["netbox_vm"],
-                    row["openstack_server"],
-                    row["change_type"],
-                    row["field"],
-                    row["openstack_value"],
-                    row["netbox_value"],
-                    row["diff"],
-                    row["mode"],
-                    row["details"],
-                ]
-            )
-
-        lines = [
+        self.log_info(
             f"### Change summary for {self._nb_vm_ref(nb_vm)} against {summary_target} "
             f"({len(change_rows)} change{'s' if len(change_rows) != 1 else ''})",
-            "",
-            "| " + " | ".join(headers) + " |",
-            "| " + " | ".join("---" for _ in headers) + " |",
-        ]
-        for row in table_rows:
-            lines.append("| " + " | ".join(self._markdown_cell(cell) for cell in row) + " |")
+            obj=nb_vm,
+        )
 
-        self.log_info("\n".join(lines), obj=nb_vm)
+        for _, row in ordered_rows:
+            field_headers = [
+                "VM",
+                "Server",
+                "Field",
+                "OpenStack",
+                "NetBox",
+                "Diff",
+                "Mode",
+                "Details",
+            ]
+            field_line = [
+                row["netbox_vm"],
+                row["openstack_server"],
+                row["field"],
+                row["openstack_value"],
+                row["netbox_value"],
+                row["diff"],
+                row["mode"],
+                row["details"],
+            ]
+            lines = [
+                f"#### {self._change_heading(row)}",
+                "",
+                "| " + " | ".join(field_headers) + " |",
+                "| " + " | ".join("---" for _ in field_headers) + " |",
+                "| " + " | ".join(self._markdown_cell(cell) for cell in field_line) + " |",
+            ]
+            self.log_info("\n".join(lines), obj=nb_vm)
 
     def _sync_vm(self, conn, nb_vm, data, commit, sync_debug=False):
         change_rows = []
