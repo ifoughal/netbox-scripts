@@ -252,6 +252,7 @@ class SyncNetBoxVMsToOpenStack(Script):
             "auth_url": data["auth_url"].strip(),
             "username": data["username"].strip(),
             "password": data["password"],
+            "identity_api_version": 3,
             "verify": bool(data.get("verify", True)),
             "app_name": "NetBox",
             "app_version": "1.0",
@@ -287,6 +288,34 @@ class SyncNetBoxVMsToOpenStack(Script):
         connection_cache[base_key] = base_conn
         return base_conn
 
+    def _resolve_project_resource(self, conn, project_id, project_name, vm_name):
+        lookup_error = None
+
+        if project_id:
+            try:
+                project = conn.identity.get_project(project_id)
+            except Exception as exc:
+                lookup_error = exc
+            else:
+                if project is not None:
+                    return project
+
+        if project_name:
+            try:
+                for project in conn.identity.projects():
+                    if (getattr(project, "name", None) or "") == project_name:
+                        return project
+            except Exception as exc:
+                lookup_error = exc
+
+        project_ref = project_id or project_name or "<unknown>"
+        if lookup_error is not None:
+            raise AbortScript(
+                f"Could not resolve OpenStack project {project_ref} for VM {vm_name}: {lookup_error}"
+            ) from lookup_error
+
+        raise AbortScript(f"Could not resolve OpenStack project {project_ref} for VM {vm_name}")
+
     def _get_connection_for_vm(self, openstack, data, vm, connection_cache):
         project_id = self._get_vm_cf_value(vm, "openstack_project_id")
         project_name = self._get_vm_cf_value(vm, "openstack_project_name")
@@ -297,20 +326,26 @@ class SyncNetBoxVMsToOpenStack(Script):
                 f"NetBox VM {vm.name} is missing custom field openstack_project_id or openstack_project_name"
             )
 
-        cache_key = (project_id or "", project_name or "", region_name or "")
-        cached = connection_cache.get(cache_key)
+        raw_cache_key = (project_id or "", project_name or "", region_name or "")
+        cached = connection_cache.get(raw_cache_key)
         if cached is not None:
             return cached
 
         base_conn = self._get_base_connection(openstack, data, region_name, connection_cache)
+        project = self._resolve_project_resource(base_conn, project_id, project_name, vm.name)
+        resolved_project_id = getattr(project, "id", None) or project_id or project_name or ""
+        cache_key = (resolved_project_id, region_name or "")
+        cached = connection_cache.get(cache_key)
+        if cached is not None:
+            connection_cache[raw_cache_key] = cached
+            return cached
 
         if hasattr(base_conn, "connect_as_project"):
-            project_ref = project_id or project_name
             try:
-                conn = base_conn.connect_as_project(project_ref)
+                conn = base_conn.connect_as_project(project)
             except Exception as exc:
                 raise AbortScript(
-                    f"Could not switch OpenStack session to project {project_ref} for VM {vm.name}: {exc}"
+                    f"Could not switch OpenStack session to project {resolved_project_id} for VM {vm.name}: {exc}"
                 ) from exc
         else:
             conn_kwargs = self._build_openstack_conn_kwargs(
@@ -326,6 +361,7 @@ class SyncNetBoxVMsToOpenStack(Script):
                     f"Could not authenticate to OpenStack for VM {vm.name}: {exc}"
                 ) from exc
 
+        connection_cache[raw_cache_key] = conn
         connection_cache[cache_key] = conn
         return conn
 
